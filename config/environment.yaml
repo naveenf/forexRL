@@ -1,0 +1,42 @@
+# Environment Configuration for Forex RL Trading System
+# Reward function settings - CRITICAL for "$100 in 4 candles" goal
+
+environment:
+  name: "MultiPairForexEnv"
+  currency_pairs:
+    - "EURUSD"
+    - "GBPUSD"
+    - "USDJPY"
+
+  timeframe: "M15"  # 15-minute candles
+  target_candles: 4  # Goal: profit in 4 candles (1 hour)
+  target_profit: 100.0  # Target profit in USD
+
+reward_function:
+  success_bonus: 500.0  # Large bonus for achieving $100 in 4 candles
+  profit_multiplier: 1.0  # Base reward for profits
+  loss_penalty: 3.0  # Penalty multiplier for losses
+  time_penalty: 0.1  # Small penalty for longer positions
+
+action_space:
+  # 9 total actions: 3 per currency pair
+  actions_per_pair: 3  # HOLD, BUY, SELL
+  total_actions: 9
+
+position_management:
+  max_positions_per_pair: 1
+  stop_loss_pips: 50
+  take_profit_pips: 100
+  lot_size: 0.1
+
+observation_space:
+  window_size: 20  # Number of historical candles
+  indicators:
+    - "rsi"
+    - "sma_10"
+    - "sma_20"
+    - "ema_12"
+    - "ema_26"
+    - "atr"
+    - "momentum"
+    - "volatility"

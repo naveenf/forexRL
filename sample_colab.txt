@@ -1,0 +1,198 @@
+!pip install git+https://github.com/DLR-RM/stable-baselines3@feat/gymnasium-support
+!pip install git+https://github.com/Stable-Baselines-Team/stable-baselines3-contrib@feat/gymnasium-support
+
+
+
+!pip install gym-anytrading
+
+!pip install shimmy>=0.2.1
+
+!pip install finta
+
+!pip install quantstats
+
+# Gym stuff
+import gym
+import gym_anytrading
+from gym_anytrading.envs import StocksEnv
+
+# Stable baselines - rl stuff
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3 import A2C
+from stable_baselines3.common.sb2_compat.rmsprop_tf_like import RMSpropTFLike
+
+#Quant Finance
+from finta import TA
+import quantstats as qs
+
+# Processing libraries
+import os
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+
+from google.colab import drive
+drive.mount('/content/drive/')
+
+with open('/content/drive/MyDrive/Alpaca_Keys.txt', 'r') as f:
+  keys = f.readlines()
+
+# from a list of keys we take the first one - '/n'
+api_key = keys[0][:-1]
+secret_key = keys[1]
+
+## Alpaca
+
+!pip install alpaca-py
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from datetime import datetime
+
+
+client = StockHistoricalDataClient(api_key,secret_key)
+
+request_params = StockBarsRequest(
+                        symbol_or_symbols=["AAPL"],
+                        timeframe=TimeFrame.Minute,
+                        start=datetime(2022, 5, 1)
+                 )
+
+bars = client.get_stock_bars(request_params)
+
+data = bars.df
+data = data.droplevel(0)
+data.head()
+
+data.info()
+
+data = data.rename(columns = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+
+## Alpha Vantage
+
+#Download 3 months of data (Alphavantage only provides 1 month per call)
+month_1 = 'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY_EXTENDED&symbol=AAPL&interval=5min&slice=year1month1&apikey={key}&datatype=csv'
+month_2 = 'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY_EXTENDED&symbol=AAPL&interval=5min&slice=year1month2&apikey={key}&datatype=csv'
+month_3 = 'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY_EXTENDED&symbol=AAPL&interval=5min&slice=year1month3&apikey={key}&datatype=csv'
+month_4 = 'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY_EXTENDED&symbol=AAPL&interval=5min&slice=year1month4&apikey={key}&datatype=csv'
+
+#Grab the Data as CSV
+csv_1 = pd.read_csv(month_1)
+csv_2 = pd.read_csv(month_2)
+csv_3 = pd.read_csv(month_3)
+csv_4 = pd.read_csv(month_4)
+
+#Put it into a DataFrame
+data_1 = pd.DataFrame(csv_1)
+data_2 = pd.DataFrame(csv_2)
+data_3 = pd.DataFrame(csv_3)
+data_4 = pd.DataFrame(csv_4)
+
+
+#Append the three months into one Dataframe
+data = data_1.append([data_2, data_3, data_4])
+
+data.head(3)
+
+data.info()
+
+data = data.rename(columns = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+
+data['time'] = pd.to_datetime(data['time'])
+data.set_index('time', inplace=True)
+data.sort_values('time', ascending=True, inplace=True)
+
+data.head()
+
+## Add Custom Indicators
+
+data['return'] = np.log(data['Close'] / data['Close'].shift(1))
+
+#Create columns for technical indicators & add them to the dataframe
+data['RSI'] = TA.RSI(data,16)
+data['SMA'] = TA.SMA(data, 20)
+data['SMA_L'] = TA.SMA(data, 41)
+data['OBV'] = TA.OBV(data)
+#data['VWAP'] = TA.VWAP(data)
+data['EMA'] = TA.EMA(data)
+data['ATR'] = TA.ATR(data)
+data.fillna(0, inplace=True)
+
+#Add momentum, volatitlity, & distance to the data_frame
+data['momentum'] = data['return'].rolling(5).mean().shift(1)
+data['volatility'] = data['return'].rolling(20).std().shift(1)
+data['distance'] = (data['Close'] - data['Close'].rolling(50).mean()).shift(1)
+
+#Perform a simple linear regression direction prediction
+lags = 5
+
+cols = []
+for lag in range(1, lags + 1):
+  col = f'lag_{lag}'
+  data[col] = data['Close'].shift(lag)
+  cols.append(col)
+
+data.dropna(inplace=True)
+
+reg = np.linalg.lstsq(data[cols], data['Close'], rcond=None)[0]
+data['Prediction'] = np.dot(data[cols], reg)
+
+data.tail()
+
+#Create a function to properly format data frame to be passed through environment
+def signals(env):
+    start = env.frame_bound[0] - env.window_size
+    end = env.frame_bound[1]
+    prices = env.df.loc[:,'Close'].to_numpy()[start:end]
+    signal_features = env.df.loc[:, ['Open','High','Low','Volume','return','trade_count','momentum','volatility','distance','RSI','OBV','SMA','SMA_L','vwap','EMA','ATR', 'Prediction']].to_numpy()[start:end]
+    return prices, signal_features
+
+#Replace default data process with custom function from above
+class MyCustomEnv(StocksEnv):
+    _process_data = signals
+
+#Initialize an environment setting the window size and train data
+window_size = 65
+start_index = window_size
+end_train_index = round(len(data)*0.80)
+end_val_index = len(data)
+
+env2 = MyCustomEnv(df=data, window_size=window_size, frame_bound=(start_index, end_train_index))
+
+#Create a Dummy Vector of our environment
+env_maker = lambda: env2
+env = DummyVecEnv([env_maker])
+
+## Train Test
+
+#initialize our model and train
+policy_kwargs = dict(optimizer_class=RMSpropTFLike, optimizer_kwargs=dict(eps=1e-5))
+actor_critic = A2C('MlpPolicy', env, policy_kwargs=policy_kwargs, verbose=1)
+actor_critic.learn(total_timesteps=200000)
+
+# Testing the Model
+
+#Create a new environment with validation data
+env = MyCustomEnv(df=data, window_size=window_size, frame_bound=(end_train_index, end_val_index))
+obs = env.reset()
+
+while True:
+    obs = obs[np.newaxis, ...]
+    action, _states = actor_critic.predict(obs)
+    obs, rewards, done, info = env.step(action)
+    if done:
+        print("info", info)
+        break
+
+#Plot the results
+plt.figure(figsize=(16,9))
+env.render_all()
+plt.show()
+
+qs.extend_pandas()
+
+net_worth = pd.Series(env.history['total_profit'], index=data.index[end_train_index+1:end_val_index])
+returns = net_worth.pct_change().iloc[1:]
+
+qs.reports.full(returns)

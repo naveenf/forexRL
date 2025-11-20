@@ -1,0 +1,59 @@
+# Desktop Application & Inference Configuration
+# Real-time trading system settings
+
+application:
+  name: "Forex RL Trading System"
+  version: "1.0.0"
+  debug_mode: false
+
+inference:
+  model_path: "models/trained_forex_model.zip"
+  confidence_threshold: 0.7  # Minimum confidence for UI display
+  prediction_interval: 60  # Seconds between predictions
+  max_latency_ms: 100  # Target system latency
+
+mt5_connection:
+  # MetaTrader 5 settings - configure with your broker
+  server: ""  # To be filled by user
+  login: ""   # To be filled by user
+  password: ""  # To be filled by user
+  timeout: 10000
+
+ui_settings:
+  theme: "dark"
+  window_size: [1200, 800]
+  refresh_rate_ms: 1000  # UI update frequency
+  chart_history_bars: 100
+
+  # 3-column layout as specified
+  layout:
+    pair_columns: 3  # EUR/USD, GBP/USD, USD/JPY
+    show_confidence_bars: true
+    show_real_time_charts: true
+
+telegram:
+  enabled: false  # Set to true when configured
+  bot_token: ""   # To be filled by user
+  chat_id: ""     # To be filled by user
+
+  # Alert settings
+  alerts:
+    trade_signals: true
+    profit_achievements: true
+    system_errors: true
+
+risk_management:
+  max_daily_loss: 500.0  # Maximum daily loss in USD
+  max_open_positions: 3  # One per pair
+  position_size_percent: 2.0  # Percentage of account per trade
+
+logging:
+  level: "INFO"
+  file: "logs/forex_trading.log"
+  max_file_size_mb: 100
+  backup_count: 5
+
+performance:
+  target_uptime_percent: 99.0
+  target_win_rate: 0.60
+  target_avg_profit: 50.0  # USD per trade

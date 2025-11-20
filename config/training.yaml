@@ -1,0 +1,47 @@
+# PPO Training Configuration
+# Adapted from sample_colab.txt A2C to PPO for better forex stability
+
+algorithm:
+  name: "PPO"
+  total_timesteps: 500000  # 500k steps for thorough training
+
+model:
+  name: "google/gemma-2b-it"
+  policy: "MlpPolicy"
+
+ppo_params:
+  learning_rate: 0.0003
+  n_steps: 2048  # PPO rollout buffer size
+  batch_size: 64
+  n_epochs: 10  # Number of epochs per update
+  gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE parameter
+  clip_range: 0.2  # PPO clipping parameter
+  ent_coef: 0.01  # Entropy coefficient
+  vf_coef: 0.5  # Value function coefficient
+  max_grad_norm: 0.5  # Gradient clipping
+
+training:
+  validation_split: 0.2
+  save_frequency: 10000  # Save model every 10k steps
+  log_frequency: 1000   # Log metrics every 1k steps
+
+  # Target metrics for training validation
+  target_episode_reward: 1000
+  target_win_rate: 0.65
+  early_stopping_patience: 50000  # Stop if no improvement
+
+data:
+  train_start_date: "2020-01-01"
+  train_end_date: "2023-12-31"
+  validation_start_date: "2024-01-01"
+  validation_end_date: "2024-06-30"
+
+evaluation:
+  episodes: 100
+  metrics:
+    - "episode_reward"
+    - "win_rate"
+    - "profit_factor"
+    - "sharpe_ratio"
+    - "max_drawdown"

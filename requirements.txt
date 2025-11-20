@@ -1,0 +1,48 @@
+# Forex Trading System Dependencies
+# Based on CLAUDE.md technical specifications
+
+# Core RL Framework
+stable-baselines3==2.1.0
+gymnasium==0.29.1
+
+# ML/AI Model
+transformers==4.35.0
+torch>=1.9.0
+numpy>=1.21.0
+
+# Trading & Market Data
+MetaTrader5==5.0.45
+pandas>=1.3.0
+yfinance>=0.1.70
+
+# Technical Analysis
+TA-Lib==0.4.28
+pandas-ta>=0.3.14b
+
+# Desktop UI Framework
+PySide6==6.6.0
+
+# Notifications
+python-telegram-bot==20.6
+
+# Configuration & Logging
+PyYAML>=6.0
+loguru>=0.6.0
+
+# Data Processing
+scipy>=1.7.0
+scikit-learn>=1.0.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# Development & Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=22.0.0
+flake8>=5.0.0
+mypy>=1.0.0
+
+# Additional utilities
+python-dotenv>=0.19.0
+tqdm>=4.60.0
+joblib>=1.1.0
