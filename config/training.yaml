@@ -1,47 +1,160 @@
-# PPO Training Configuration
-# Adapted from sample_colab.txt A2C to PPO for better forex stability
+# PPO Training Configuration for Forex Trading System
+# Optimized for "$100 in 4 candles" trading goal
 
+# Algorithm Configuration
 algorithm:
   name: "PPO"
-  total_timesteps: 500000  # 500k steps for thorough training
+  total_timesteps: 500000  # 500k steps (12-24 hours on GPU)
+  device: "cuda"  # Use GPU in Google Colab
+  verbose: 1
 
+# Model Configuration
 model:
-  name: "google/gemma-2b-it"
+  name: "google/gemma-2b-it"  # Gemma 2B model
   policy: "MlpPolicy"
+  policy_kwargs:
+    net_arch:
+      - 512  # Hidden layer size
+      - 256
+      - 128
+    activation_fn: "tanh"
 
+# PPO Hyperparameters (Optimized for Forex)
 ppo_params:
-  learning_rate: 0.0003
-  n_steps: 2048  # PPO rollout buffer size
-  batch_size: 64
-  n_epochs: 10  # Number of epochs per update
-  gamma: 0.99  # Discount factor
-  gae_lambda: 0.95  # GAE parameter
-  clip_range: 0.2  # PPO clipping parameter
-  ent_coef: 0.01  # Entropy coefficient
-  vf_coef: 0.5  # Value function coefficient
-  max_grad_norm: 0.5  # Gradient clipping
+  learning_rate: 3e-4        # Adaptive learning rate
+  n_steps: 2048              # Steps per environment per update
+  batch_size: 64             # Mini-batch size
+  n_epochs: 10               # Epochs per update
+  gamma: 0.99                # Discount factor
+  gae_lambda: 0.95           # GAE lambda
+  clip_range: 0.2            # PPO clipping parameter
+  clip_range_vf: null        # Value function clipping
+  ent_coef: 0.01             # Entropy coefficient
+  vf_coef: 0.5               # Value function coefficient
+  max_grad_norm: 0.5         # Gradient clipping
+  target_kl: null            # Target KL divergence
+  normalize_advantage: true
 
+# Training Configuration
 training:
+  # Data splits
   validation_split: 0.2
-  save_frequency: 10000  # Save model every 10k steps
-  log_frequency: 1000   # Log metrics every 1k steps
+
+  # Saving and logging
+  save_frequency: 25000      # Save model every 25k steps
+  log_frequency: 100         # Log metrics every 100 steps
+  eval_frequency: 10000      # Evaluate every 10k steps
+
+  # Directories
+  model_save_path: "./models/checkpoints"
+  tensorboard_log: "./logs/tensorboard"
+  eval_log_path: "./logs/evaluations"
 
   # Target metrics for training validation
-  target_episode_reward: 1000
-  target_win_rate: 0.65
-  early_stopping_patience: 50000  # Stop if no improvement
+  target_episode_reward: 1000.0   # Target episode reward
+  target_win_rate: 0.65           # Target 65% win rate
+  early_stopping_patience: 5      # Stop if no improvement for 5 evaluations
+  min_reward_threshold: 500.0     # Minimum reward threshold
 
+# Environment Configuration
+environment:
+  # Trading parameters
+  initial_balance: 10000.0
+  max_positions_per_pair: 1
+  lot_size: 0.1
+  max_episode_steps: 1000
+  commission_per_lot: 3.0
+
+  # Currency pairs
+  pairs: ["EURUSD", "AUDCHF", "USDJPY"]
+
+  # Spread configuration (pips)
+  spread_pips:
+    EURUSD: 1.5
+    AUDCHF: 2.5
+    USDJPY: 1.8
+
+  # Stop Loss / Take Profit (pips)
+  sl_tp_pips: [20.0, 40.0]  # [stop_loss, take_profit]
+
+# Data Configuration
 data:
-  train_start_date: "2020-01-01"
-  train_end_date: "2023-12-31"
-  validation_start_date: "2024-01-01"
-  validation_end_date: "2024-06-30"
+  # Historical data range
+  history_days: 365
+  timeframe: "15M"  # 15-minute candles
 
+  # Data preprocessing
+  normalize_observations: true
+  handle_missing_data: "forward_fill"
+  outlier_clipping: true
+  outlier_std_threshold: 3.0
+
+# Evaluation Configuration
 evaluation:
-  episodes: 100
-  metrics:
-    - "episode_reward"
-    - "win_rate"
-    - "profit_factor"
-    - "sharpe_ratio"
-    - "max_drawdown"
+  episodes: 50  # Number of evaluation episodes
+  deterministic: true  # Use deterministic policy for evaluation
+
+  # Success metrics
+  target_metrics:
+    episode_reward: 1000.0
+    win_rate: 0.65
+    profit_factor: 1.5
+    sharpe_ratio: 1.0
+    max_drawdown: 0.15
+
+  # Specific forex metrics
+  forex_metrics:
+    target_profit_per_trade: 100.0    # $100 target
+    target_duration_candles: 4        # 4 candles max
+    successful_trades_threshold: 5     # Success if >=5 goal trades
+
+# Callbacks Configuration
+callbacks:
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_reward_threshold: 500.0
+
+  # Model checkpointing
+  checkpoint:
+    enabled: true
+    save_freq: 25000
+    save_path: "./models/checkpoints"
+
+  # Learning rate scheduling
+  lr_schedule:
+    enabled: false  # Disable for initial training
+
+  # Custom forex callback
+  forex_tracker:
+    enabled: true
+    log_successful_goal_trades: true
+    track_session_performance: true
+
+# Resource Management
+resources:
+  # Memory settings
+  max_memory_usage_mb: 8000
+
+  # GPU settings
+  gpu_memory_growth: true
+  mixed_precision: false
+
+  # Reproducibility
+  seed: 42
+  deterministic_training: true
+
+# Export Configuration
+export:
+  final_model_path: "./models/final/forex_ppo_model"
+  model_format: "pytorch"  # pytorch, onnx
+  include_config: true
+  model_version: "v1.0"
+
+# Debug Settings
+debug:
+  log_level: "INFO"
+  check_environment: true
+  profile_training: false
+  render_episodes: false  # Keep false for Colab

@@ -238,6 +238,7 @@ wandb/
 .dvc/
 
 # Large data files (use DVC instead)
+*.csv
 *.csv.gz
 *.parquet
 *.feather

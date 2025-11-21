@@ -67,7 +67,7 @@ class DataManager:
         """
         self.config = self._load_config(config_path)
         self.mt5_initialized = False
-        self.currency_pairs = ['EURUSD', 'GBPUSD', 'USDJPY']
+        self.currency_pairs = ['EURUSD', 'AUDCHF', 'USDJPY']
         self.timeframe = 15 if not MT5_AVAILABLE else mt5.TIMEFRAME_M15  # 15-minute candles
 
         # Technical indicators configuration
@@ -204,9 +204,165 @@ class DataManager:
             logger.error(f"Error fetching data for {symbol}: {e}")
             return pd.DataFrame()
 
+    def load_csv_data(self, csv_files: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+        """
+        Load forex data from CSV files provided by user.
+
+        Expected CSV format:
+        - Columns: Date, Time, Open, High, Low, Close, Volume
+        - OR: DateTime, Open, High, Low, Close, Volume
+        - Date format: YYYY-MM-DD or DD/MM/YYYY
+        - Time format: HH:MM:SS (if separate) or combined DateTime
+
+        Args:
+            csv_files: Dictionary mapping pair names to file paths
+                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'GBPUSD': 'data/GBPUSD_15M.csv'}
+
+        Returns:
+            Dictionary with loaded and processed data for each currency pair
+        """
+        logger.info(f"Loading CSV data for {len(csv_files)} currency pairs...")
+
+        loaded_data = {}
+
+        for pair, file_path in csv_files.items():
+            try:
+                logger.info(f"Loading {pair} from {file_path}")
+
+                # Try to read CSV with different common formats
+                df = self._read_csv_flexible(file_path)
+
+                if df is None:
+                    logger.error(f"Failed to load {pair} from {file_path}")
+                    continue
+
+                # Validate and process the data
+                df = self._process_csv_data(df, pair)
+
+                if len(df) > 0:
+                    loaded_data[pair] = df
+                    logger.info(f"✅ {pair}: {len(df)} candles loaded ({df.index.min()} to {df.index.max()})")
+                else:
+                    logger.warning(f"❌ {pair}: No valid data after processing")
+
+            except Exception as e:
+                logger.error(f"Error loading {pair}: {e}")
+                continue
+
+        if loaded_data:
+            logger.info(f"Successfully loaded data for {list(loaded_data.keys())}")
+        else:
+            logger.warning("No data loaded from CSV files - falling back to sample data")
+            return self.load_sample_data()
+
+        return loaded_data
+
+    def _read_csv_flexible(self, file_path: str) -> Optional[pd.DataFrame]:
+        """Try different CSV reading approaches."""
+        read_attempts = [
+            # Common separators and date formats
+            {'sep': ',', 'parse_dates': [0], 'index_col': 0},
+            {'sep': ';', 'parse_dates': [0], 'index_col': 0},
+            {'sep': '\t', 'parse_dates': [0], 'index_col': 0},
+            {'sep': ',', 'parse_dates': [[0, 1]], 'index_col': 0},  # Separate date/time columns
+            {'sep': ','}  # No date parsing, will handle manually
+        ]
+
+        for attempt in read_attempts:
+            try:
+                df = pd.read_csv(file_path, **attempt)
+                if len(df) > 100:  # Minimum viable dataset
+                    return df
+            except:
+                continue
+
+        return None
+
+    def _process_csv_data(self, df: pd.DataFrame, pair: str) -> pd.DataFrame:
+        """Process and standardize CSV data format."""
+        # Create a copy
+        df = df.copy()
+
+        # Standardize column names (case-insensitive)
+        df.columns = df.columns.str.strip().str.lower()
+
+        # Map common column name variations
+        column_mapping = {
+            'datetime': 'datetime',
+            'date': 'date',
+            'time': 'time',
+            'timestamp': 'datetime',
+            'open': 'Open',
+            'high': 'High',
+            'low': 'Low',
+            'close': 'Close',
+            'volume': 'Volume',
+            'vol': 'Volume',
+            'tick_volume': 'Volume'
+        }
+
+        # Rename columns
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df = df.rename(columns={old_col: new_col})
+
+        # Handle datetime index
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if 'datetime' in df.columns:
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                df.set_index('datetime', inplace=True)
+            elif 'date' in df.columns and 'time' in df.columns:
+                df['datetime'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
+                df.set_index('datetime', inplace=True)
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+            else:
+                # Try to use first column as datetime
+                df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
+                df.set_index(df.columns[0], inplace=True)
+
+        # Ensure required OHLC columns exist
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        for col in required_cols:
+            if col not in df.columns:
+                logger.error(f"Missing required column: {col}")
+                return pd.DataFrame()
+
+        # Add Volume if missing (use tick volume approximation)
+        if 'Volume' not in df.columns:
+            df['Volume'] = np.random.lognormal(8, 0.5, len(df)).astype(int)
+            logger.info(f"Added synthetic volume data for {pair}")
+
+        # Add Symbol column
+        df['Symbol'] = pair
+
+        # Sort by datetime
+        df.sort_index(inplace=True)
+
+        # Remove invalid data
+        df = df.dropna(subset=required_cols)
+
+        # Validate OHLC relationships
+        invalid_rows = (
+            (df['High'] < df[['Open', 'Close']].max(axis=1)) |
+            (df['Low'] > df[['Open', 'Close']].min(axis=1)) |
+            (df['High'] < df['Low'])
+        )
+
+        if invalid_rows.sum() > 0:
+            logger.warning(f"Removing {invalid_rows.sum()} rows with invalid OHLC data")
+            df = df[~invalid_rows]
+
+        # Convert to numeric
+        for col in required_cols + ['Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        return df
+
     def load_sample_data(self) -> Dict[str, pd.DataFrame]:
         """
-        Generate sample forex data for testing when MT5 is not available.
+        Generate sample forex data for testing when real data is not available.
 
         Returns:
             Dictionary with sample data for each currency pair
@@ -694,20 +850,39 @@ class DataManager:
 
         logger.info(f"Technical indicators plotted for {pair}")
 
-    def get_multi_pair_data(self, days: int = 365) -> Dict[str, pd.DataFrame]:
+    def get_multi_pair_data(self, days: int = 365, csv_files: Optional[Dict[str, str]] = None) -> Dict[str, pd.DataFrame]:
         """
         Get processed data for all currency pairs.
 
         Args:
-            days: Number of days of historical data
+            days: Number of days of historical data (for MT5 or sample data)
+            csv_files: Optional dictionary mapping pair names to CSV file paths
+                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'GBPUSD': 'data/GBPUSD_15M.csv'}
 
         Returns:
             Dictionary with processed data for each currency pair
         """
         all_data = {}
 
-        # Try to get real data first
+        # Priority 1: Use user-provided CSV files
+        if csv_files:
+            logger.info("Loading data from user-provided CSV files...")
+            csv_data = self.load_csv_data(csv_files)
+
+            for pair, df in csv_data.items():
+                df = self.calculate_technical_indicators(df)
+                df = self.preprocess_data(df)
+                all_data[pair] = df
+
+            if all_data:
+                logger.info("✅ Using CSV data for training")
+                self._log_data_summary(all_data)
+                validation_results = self.validate_data_quality(all_data)
+                return all_data
+
+        # Priority 2: Try to get MT5 real data
         if self.initialize_mt5():
+            logger.info("Loading data from MetaTrader 5...")
             for pair in self.currency_pairs:
                 df = self.get_historical_data(pair, days)
                 if not df.empty:
@@ -715,11 +890,11 @@ class DataManager:
                     df = self.preprocess_data(df)
                     all_data[pair] = df
                 else:
-                    logger.warning(f"No real data for {pair}, using sample data")
+                    logger.warning(f"No MT5 data for {pair}")
 
-        # If no real data available, use sample data
+        # Priority 3: Use sample data as fallback
         if not all_data:
-            logger.info("Using sample data for all pairs")
+            logger.info("Using generated sample data for all pairs")
             sample_data = self.load_sample_data()
 
             for pair, df in sample_data.items():
@@ -731,7 +906,16 @@ class DataManager:
         validation_results = self.validate_data_quality(all_data)
 
         logger.info(f"Multi-pair data ready: {list(all_data.keys())}")
+        self._log_data_summary(all_data)
         return all_data
+
+    def _log_data_summary(self, data: Dict[str, pd.DataFrame]):
+        """Log summary of loaded data."""
+        for pair, df in data.items():
+            date_range = f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
+            total_days = (df.index.max() - df.index.min()).days
+            features = len([col for col in df.columns if col != 'Symbol'])
+            logger.info(f"📊 {pair}: {len(df):,} candles | {total_days} days | {features} features | {date_range}")
 
     def cleanup(self):
         """Clean up resources and close MT5 connection."""

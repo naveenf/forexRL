@@ -205,6 +205,34 @@ python -m src.inference_engine
 python -m src.backtesting
 ```
 
+## Git Commit Guidelines
+
+**Keep commit messages concise and professional:**
+
+### Format
+- **Maximum 2 lines total**
+- **First line:** Brief summary (50 chars or less)
+- **Second line:** Optional details if needed
+- **NO Claude Code attribution** - keep messages clean and focused
+
+### Examples
+```bash
+# Good - concise and clear
+git commit -m "feat: implement RL environment with custom reward function
+Support multi-pair trading with 9-action space"
+
+# Bad - too verbose, includes attribution
+git commit -m "feat: Complete Phase 2-3 - RL Environment & Training Setup with multiple features... 🤖 Generated with Claude Code"
+```
+
+### Conventional Commits
+- `feat:` - New feature
+- `fix:` - Bug fix
+- `docs:` - Documentation changes
+- `refactor:` - Code restructuring
+- `test:` - Test additions/changes
+- `chore:` - Maintenance tasks
+
 ## Priority Files to Create (Development Order)
 
 1. **`src/data_manager.py`** - Data pipeline and indicators

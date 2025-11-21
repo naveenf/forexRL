@@ -1,0 +1,32 @@
+# Requirements for Google Colab Training - FIXED VERSION
+# Forex Trading System - PPO Training Dependencies
+
+# Core RL Framework - Compatible versions for Colab
+gymnasium>=0.28.0,<0.30.0
+stable-baselines3>=1.8.0,<2.0.0
+
+# Core ML packages that work with current Colab
+torch
+numpy
+pandas
+scipy
+
+# Transformer support - use Colab compatible versions
+transformers
+accelerate
+
+# Basic data processing
+matplotlib
+seaborn
+pyyaml
+tqdm
+psutil
+
+# Skip problematic packages for now:
+# - tensorboard (use Colab's built-in)
+# - TA-Lib (manual install)
+# - Complex dependencies
+
+# Optional packages - install if available
+# plotly
+# scikit-learn

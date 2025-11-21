@@ -88,6 +88,21 @@ def run_desktop_app() -> int:
     try:
         logger.info("🚀 Starting Forex RL Trading System - Desktop Mode")
 
+        # Check if UI is implemented
+        ui_path = PROJECT_ROOT / "src" / "ui" / "main_window.py"
+        if not ui_path.exists():
+            logger.warning("⚠️  Desktop UI not implemented yet (Phase 5)")
+            logger.info("Currently available:")
+            logger.info("  - Phase 1: ✅ DataManager (completed)")
+            logger.info("  - Phase 2: ⏳ RL Environment (next)")
+            logger.info("  - Phase 3: ⏳ Training")
+            logger.info("  - Phase 4: ⏳ Inference Engine")
+            logger.info("  - Phase 5: ⏳ Desktop UI")
+            logger.info("")
+            logger.info("For now, you can test the DataManager:")
+            logger.info("  python -c \"from src.data_manager import DataManager; dm = DataManager(); data = dm.load_sample_data(); print(f'✅ {len(data)} pairs loaded')\"")
+            return 0
+
         # Import here to avoid issues if PySide6 not installed
         from src.ui.main_window import ForexTradingApp
         from PySide6.QtWidgets import QApplication
@@ -122,13 +137,26 @@ def run_test_mode() -> int:
     logger.info("🧪 Test mode - Running system validation")
 
     try:
-        # Test imports
-        logger.info("Testing core imports...")
-        import stable_baselines3
-        import gymnasium
+        # Test basic imports
+        logger.info("Testing basic imports...")
         import pandas
         import numpy
-        logger.info("✅ Core dependencies imported successfully")
+        logger.info("✅ Basic dependencies imported successfully")
+
+        # Test DataManager
+        logger.info("Testing DataManager...")
+        from src.data_manager import DataManager
+        dm = DataManager()
+        data = dm.load_sample_data()
+        logger.info(f"✅ DataManager working: {len(data)} pairs loaded")
+
+        # Test optional RL imports
+        try:
+            import stable_baselines3
+            import gymnasium
+            logger.info("✅ RL dependencies imported successfully")
+        except ImportError:
+            logger.warning("⚠️  RL dependencies not installed (optional for now)")
 
         # Test YAML loading
         logger.info("Testing configuration loading...")
