@@ -29,6 +29,7 @@ import torch
 # Import RL frameworks
 import gymnasium as gym
 from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO  # LSTM-based PPO for temporal learning
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
@@ -40,10 +41,10 @@ from stable_baselines3.common.logger import configure
 # Import custom modules (ensure these are uploaded to Colab)
 try:
     from data_manager import DataManager
-    from environment import MultiPairForexEnv
+    from environment_single import SinglePairForexEnv  # CHANGED: Use single-pair environment
 except ImportError as e:
     print(f"Error importing custom modules: {e}")
-    print("Make sure to upload data_manager.py and environment.py to Colab")
+    print("Make sure to upload data_manager.py and environment_single.py to Colab")
     sys.exit(1)
 
 # Configure logging
@@ -57,77 +58,261 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
 
-class ForexTrainingCallback(BaseCallback):
+class EnhancedForexCallback(BaseCallback):
     """
-    Custom callback for forex-specific training monitoring.
+    Enhanced callback for comprehensive forex trading analytics.
 
     Tracks:
-    - Successful trades ($100 in ≤4 candles)
-    - Win rate and profit metrics
-    - Session performance
+    - Detailed trade statistics and performance metrics
+    - Risk-adjusted returns and drawdown analysis
+    - Per-pair performance analysis
+    - Real-time profitability indicators
     """
 
     def __init__(self, config: Dict[str, Any], verbose: int = 1):
         super().__init__(verbose)
         self.config = config
+
+        # Trade tracking
+        self.all_trades = []
+        self.trades_by_pair = {'USDJPY': []}  # CHANGED: Single pair only
         self.successful_goal_trades = []
+
+        # Episode tracking
         self.total_episodes = 0
         self.episode_rewards = []
-        self.episode_trades = []
+        self.episode_balances = []
+        self.episode_trade_counts = []
+
+        # Performance metrics
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.max_consecutive_losses = 0
+        self.current_consecutive_losses = 0
+        self.max_drawdown = 0.0
+        self.peak_balance = 10000.0  # Starting balance
+
+        # Risk metrics
+        self.risk_metrics = []
+        self.hourly_performance = {}
+
+        # Analytics for export
+        self.chunk_analytics = {}
+
+        # Action distribution tracking (Fix #2 for "0 trades" issue)
+        self.action_counts = {0: 0, 1: 0, 2: 0}  # HOLD, BUY, SELL
 
     def _on_step(self) -> bool:
+        # Track action distribution (Fix #2 for "0 trades" issue)
+        if 'actions' in self.locals:
+            actions = self.locals['actions']
+            if isinstance(actions, (np.ndarray, list)):
+                for action in np.atleast_1d(actions):
+                    self.action_counts[int(action)] += 1
+
         # Extract info from the environment
-        if hasattr(self.locals, 'infos') and self.locals['infos']:
+        # FIX: self.locals is a dict, use 'in' instead of hasattr()
+        if 'infos' in self.locals and self.locals['infos']:
             for info in self.locals['infos']:
                 if isinstance(info, dict):
-                    # Track closed positions that achieved the goal
-                    if 'closed_positions' in info:
-                        for pos_info in info['closed_positions']:
-                            if (pos_info.get('pnl', 0) >= 100.0 and
-                                pos_info.get('duration', float('inf')) <= 4):
-                                self.successful_goal_trades.append({
-                                    'step': self.num_timesteps,
-                                    'pair': pos_info.get('pair'),
-                                    'pnl': pos_info['pnl'],
-                                    'duration': pos_info['duration']
-                                })
-                                logger.info(f"🎯 GOAL ACHIEVED! ${pos_info['pnl']:.2f} "
-                                          f"in {pos_info['duration']} candles - "
-                                          f"Pair: {pos_info.get('pair')}")
+                    # Track closed position (CHANGED for single-pair)
+                    if 'closed_position' in info and info['closed_position']:
+                        pos_info = info['closed_position']
+                        trade_data = {
+                            'step': self.num_timesteps,
+                            'pair': 'USDJPY',  # Single pair only
+                            'pnl': pos_info.get('pnl', 0),
+                            'duration': pos_info.get('duration', 0),
+                            'reason': pos_info.get('reason', 'UNKNOWN'),
+                            'timestamp': pd.Timestamp.now(),
+                            'is_winning': pos_info.get('pnl', 0) > 0
+                        }
 
-                    # Track episode completion
+                        # Add to trade records
+                        self.all_trades.append(trade_data)
+                        self.trades_by_pair['USDJPY'].append(trade_data)
+
+                        # Update performance counters
+                        self.total_trades += 1
+                        pnl = trade_data['pnl']
+
+                        if pnl > 0:
+                            self.winning_trades += 1
+                            self.total_profit += pnl
+                            self.current_consecutive_losses = 0
+                        else:
+                            self.losing_trades += 1
+                            self.total_loss += abs(pnl)
+                            self.current_consecutive_losses += 1
+                            self.max_consecutive_losses = max(
+                                self.max_consecutive_losses,
+                                self.current_consecutive_losses
+                            )
+
+                        # Track goal achievements (updated criteria)
+                        if (pnl >= 37.50 and trade_data['duration'] <= 12):
+                            self.successful_goal_trades.append(trade_data)
+                            logger.info(f"🎯 PRIMARY GOAL! ${pnl:.2f} "
+                                      f"in {trade_data['duration']} candles - "
+                                      f"Pair: USDJPY")
+
+                    # Track episode completion and balance
                     if 'episode' in info and info['episode']:
                         ep_info = info['episode']
                         self.episode_rewards.append(ep_info['r'])
                         self.total_episodes += 1
 
-                        # Log episode summary every 10 episodes
-                        if self.total_episodes % 10 == 0:
-                            recent_rewards = self.episode_rewards[-10:]
-                            avg_reward = np.mean(recent_rewards)
-                            goal_trades_count = len(self.successful_goal_trades)
+                        # Track balance for drawdown calculation
+                        current_balance = info.get('balance', 10000.0)
+                        self.episode_balances.append(current_balance)
+                        self.peak_balance = max(self.peak_balance, current_balance)
 
-                            logger.info(f"Episode {self.total_episodes}: "
-                                      f"Avg Reward: {avg_reward:.1f}, "
-                                      f"Goal Trades: {goal_trades_count}")
+                        # Calculate drawdown
+                        if current_balance < self.peak_balance:
+                            drawdown = (self.peak_balance - current_balance) / self.peak_balance
+                            self.max_drawdown = max(self.max_drawdown, drawdown)
+
+                        # Count trades in this episode
+                        episode_trades = len([t for t in self.all_trades
+                                            if t['step'] >= self.num_timesteps - 1000])
+                        self.episode_trade_counts.append(episode_trades)
+
+                        # Enhanced logging every 5 episodes
+                        if self.total_episodes % 5 == 0:
+                            self._log_detailed_progress()
 
         return True
 
+    def _log_detailed_progress(self):
+        """Log detailed training progress with analytics."""
+        recent_rewards = self.episode_rewards[-5:]
+        avg_reward = np.mean(recent_rewards) if recent_rewards else 0
+
+        # Calculate performance metrics
+        win_rate = (self.winning_trades / max(self.total_trades, 1)) * 100
+        profit_factor = self.total_profit / max(abs(self.total_loss), 1)
+        avg_profit = self.total_profit / max(self.winning_trades, 1)
+        avg_loss = abs(self.total_loss) / max(self.losing_trades, 1)
+
+        # Calculate mean duration for console display
+        mean_duration = np.mean([trade['duration'] for trade in self.all_trades]) if self.all_trades else 0.0
+
+        logger.info(f"📊 Episode {self.total_episodes} Analytics:")
+        logger.info(f"  💰 Avg Reward: {avg_reward:.1f}")
+        logger.info(f"  📈 Total Trades: {self.total_trades} (W:{self.winning_trades}, L:{self.losing_trades})")
+        logger.info(f"  🎯 Win Rate: {win_rate:.1f}%")
+        logger.info(f"  ⏱️  Mean Duration: {mean_duration:.1f} candles")
+        logger.info(f"  💵 Profit Factor: {profit_factor:.2f}")
+        logger.info(f"  ⚡ Avg Win: ${avg_profit:.2f}, Avg Loss: ${avg_loss:.2f}")
+        logger.info(f"  📉 Max Drawdown: {self.max_drawdown*100:.2f}%")
+
+        # Log action distribution (Fix #2 for "0 trades" issue)
+        total_actions = sum(self.action_counts.values())
+        if total_actions > 0:
+            hold_pct = (self.action_counts[0] / total_actions) * 100
+            buy_pct = (self.action_counts[1] / total_actions) * 100
+            sell_pct = (self.action_counts[2] / total_actions) * 100
+            logger.info(f"  🎬 Actions: HOLD {hold_pct:.1f}%, BUY {buy_pct:.1f}%, SELL {sell_pct:.1f}%")
+        logger.info(f"  🔄 Max Consecutive Losses: {self.max_consecutive_losses}")
+        logger.info(f"  🌟 Goal Trades: {len(self.successful_goal_trades)}")
+
     def _on_rollout_end(self) -> None:
-        """Called at the end of each rollout."""
-        if len(self.successful_goal_trades) > 0:
-            recent_goals = [trade for trade in self.successful_goal_trades
-                           if self.num_timesteps - trade['step'] <= 2048]  # Last rollout
+        """Called at the end of each rollout with comprehensive TensorBoard logging."""
+        # Basic performance metrics
+        win_rate = (self.winning_trades / max(self.total_trades, 1)) * 100
+        profit_factor = self.total_profit / max(abs(self.total_loss), 1)
 
-            if recent_goals:
-                avg_pnl = np.mean([trade['pnl'] for trade in recent_goals])
-                avg_duration = np.mean([trade['duration'] for trade in recent_goals])
+        # Recent performance (last rollout)
+        recent_trades = [t for t in self.all_trades
+                        if self.num_timesteps - t['step'] <= 2048]
 
-                # Log to TensorBoard
-                self.logger.record("forex/goal_trades_per_rollout", len(recent_goals))
-                self.logger.record("forex/avg_goal_trade_pnl", avg_pnl)
-                self.logger.record("forex/avg_goal_trade_duration", avg_duration)
-                self.logger.record("forex/total_goal_trades", len(self.successful_goal_trades))
+        recent_wins = len([t for t in recent_trades if t['is_winning']])
+        recent_win_rate = (recent_wins / max(len(recent_trades), 1)) * 100
+
+        # Goal trade analysis
+        recent_goals = [trade for trade in self.successful_goal_trades
+                       if self.num_timesteps - trade['step'] <= 2048]
+
+        # Calculate mean trade duration
+        mean_duration = 0.0
+        if self.all_trades:
+            mean_duration = np.mean([trade['duration'] for trade in self.all_trades])
+
+        # Log comprehensive metrics to TensorBoard
+        self.logger.record("forex/total_trades", self.total_trades)
+        self.logger.record("forex/win_rate", win_rate)
+        self.logger.record("forex/profit_factor", profit_factor)
+        self.logger.record("forex/max_drawdown", self.max_drawdown)
+        self.logger.record("forex/max_consecutive_losses", self.max_consecutive_losses)
+        self.logger.record("forex/mean_trade_duration", mean_duration)
+
+        # Recent performance
+        self.logger.record("forex/recent_trades_count", len(recent_trades))
+        self.logger.record("forex/recent_win_rate", recent_win_rate)
+
+        # Goal achievements
+        self.logger.record("forex/total_goal_trades", len(self.successful_goal_trades))
+        self.logger.record("forex/recent_goal_trades", len(recent_goals))
+
+        if recent_goals:
+            avg_goal_pnl = np.mean([trade['pnl'] for trade in recent_goals])
+            avg_goal_duration = np.mean([trade['duration'] for trade in recent_goals])
+            self.logger.record("forex/avg_goal_trade_pnl", avg_goal_pnl)
+            self.logger.record("forex/avg_goal_trade_duration", avg_goal_duration)
+
+        # Per-pair analysis
+        for pair in self.trades_by_pair:
+            pair_trades = self.trades_by_pair[pair]
+            if pair_trades:
+                pair_wins = len([t for t in pair_trades if t['is_winning']])
+                pair_win_rate = (pair_wins / len(pair_trades)) * 100
+                self.logger.record(f"forex/{pair.lower()}_win_rate", pair_win_rate)
+                self.logger.record(f"forex/{pair.lower()}_trades", len(pair_trades))
+
+    def export_analytics(self, chunk_num: int) -> Dict:
+        """Export comprehensive analytics for this training chunk."""
+        analytics = {
+            'chunk_number': chunk_num,
+            'total_timesteps': self.num_timesteps,
+            'total_episodes': self.total_episodes,
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'losing_trades': self.losing_trades,
+            'win_rate': (self.winning_trades / max(self.total_trades, 1)) * 100,
+            'profit_factor': self.total_profit / max(abs(self.total_loss), 1),
+            'total_profit': self.total_profit,
+            'total_loss': abs(self.total_loss),
+            'max_drawdown': self.max_drawdown,
+            'max_consecutive_losses': self.max_consecutive_losses,
+            'goal_trades_count': len(self.successful_goal_trades),
+            'trades_by_pair': {
+                pair: {
+                    'count': len(trades),
+                    'wins': len([t for t in trades if t['is_winning']]),
+                    'avg_pnl': np.mean([t['pnl'] for t in trades]) if trades else 0
+                } for pair, trades in self.trades_by_pair.items()
+            },
+            'avg_trade_duration': np.mean([t['duration'] for t in self.all_trades]) if self.all_trades else 0,
+            'avg_episode_reward': np.mean(self.episode_rewards) if self.episode_rewards else 0,
+            'peak_balance': self.peak_balance,
+            'current_balance': self.episode_balances[-1] if self.episode_balances else 1000.0
+        }
+
+        # Save analytics
+        self.chunk_analytics[chunk_num] = analytics
+        return analytics
+
+    def export_detailed_trades(self, chunk_num: int) -> pd.DataFrame:
+        """Export detailed trade data as DataFrame."""
+        if not self.all_trades:
+            return pd.DataFrame()
+
+        trades_df = pd.DataFrame(self.all_trades)
+        trades_df['chunk_number'] = chunk_num
+        return trades_df
 
 
 class ForexTrainer:
@@ -179,7 +364,7 @@ class ForexTrainer:
                 'eval_frequency': 10000, 'tensorboard_log': './logs/tensorboard'
             },
             'environment': {
-                'initial_balance': 10000.0, 'pairs': ['EURUSD', 'GBPUSD', 'USDJPY']
+                'initial_balance': 10000.0, 'pairs': ['EURUSD', 'AUDCHF', 'USDJPY']
             },
             'evaluation': {
                 'episodes': 50,
@@ -248,28 +433,45 @@ class ForexTrainer:
         """Create forex trading environment."""
         env_config = self.config.get('environment', {})
 
-        # Create base environment
-        env = MultiPairForexEnv(
-            data=data,
-            pairs=env_config.get('pairs', ['EURUSD', 'GBPUSD', 'USDJPY']),
+        # CHANGED: Use single-pair environment with USD/JPY data only
+        usdjpy_data = data.get('USDJPY', list(data.values())[0])  # Get USDJPY or first available
+
+        env = SinglePairForexEnv(
+            data=usdjpy_data,
             initial_balance=env_config.get('initial_balance', 10000.0),
-            max_positions_per_pair=env_config.get('max_positions_per_pair', 1),
-            lot_size=env_config.get('lot_size', 0.1),
-            spread_pips=env_config.get('spread_pips', {'EURUSD': 1.5, 'GBPUSD': 2.0, 'USDJPY': 1.8}),
-            sl_tp_pips=tuple(env_config.get('sl_tp_pips', [20.0, 40.0])),
-            max_episode_steps=env_config.get('max_episode_steps', 1000),
-            commission_per_lot=env_config.get('commission_per_lot', 3.0)
+            lot_size=env_config.get('lot_size', 0.01),
+            spread_pips=env_config.get('spread_pips', {}).get('USDJPY', 1.8),
+            sl_tp_pips=tuple(env_config.get('sl_tp_pips', [15.0, 22.5])),
+            max_episode_steps=env_config.get('max_episode_steps', 1500),
+            commission_per_lot=env_config.get('commission_per_lot', 0.5),
+            risk_per_trade_pct=env_config.get('risk_per_trade_pct', 0.03),
+            max_position_duration=env_config.get('max_position_duration', 24)
         )
 
         # Wrap environment for monitoring
         env = Monitor(env)
 
-        logger.info(f"Environment created - Training: {is_training}")
+        # Vectorize environment (required for stable-baselines3)
+        env = DummyVecEnv([lambda: env])
+
+        # Add VecNormalize for observation normalization ONLY (Fix: reward normalization was distorting signals)
+        if is_training:
+            env = VecNormalize(
+                env,
+                norm_obs=True,       # Normalize observations (prices ~145 vs indicators 0-1)
+                norm_reward=False,   # DISABLED: Was causing massive reward distortion (episodes showing 9000+ reward)
+                clip_obs=10.0,       # Clip normalized obs to [-10, 10]
+                clip_reward=10.0,    # Clip rewards to [-10, 10] without normalization
+                gamma=0.99           # Discount factor
+            )
+            logger.info("VecNormalize applied for training (observation normalization only, reward clipping)")
+
+        logger.info(f"Single-pair environment created (USD/JPY) - Training: {is_training}")
         return env
 
-    def create_model(self) -> PPO:
-        """Create and configure PPO model."""
-        logger.info("Creating PPO model...")
+    def create_model(self) -> RecurrentPPO:
+        """Create and configure RecurrentPPO model with LSTM policy."""
+        logger.info("Creating RecurrentPPO model with LSTM policy...")
 
         # Create training environment
         self.env = self.create_environment(self.train_data, is_training=True)
@@ -277,18 +479,40 @@ class ForexTrainer:
         # PPO parameters
         ppo_params = self.config.get('ppo_params', {})
 
+        # Adjust for LSTM (memory intensive, use smaller batches)
+        ppo_params['n_steps'] = 2048  # Reduced from 4096 for LSTM
+        ppo_params['batch_size'] = 64  # Reduced from 128 for LSTM
+
+        # Ensure learning_rate is a float
+        lr = ppo_params.get('learning_rate', 1e-4)
+        if isinstance(lr, str):
+            try:
+                lr = float(lr)
+            except ValueError:
+                logger.warning(f"Invalid learning rate: {lr}, using default 1e-4")
+                lr = 1e-4
+        ppo_params['learning_rate'] = lr
+
         # Model configuration
         model_config = self.config.get('model', {})
-        policy_kwargs = model_config.get('policy_kwargs', {
-            'net_arch': [512, 256, 128],
-            'activation_fn': torch.nn.Tanh
-        })
 
-        # Create PPO model
-        self.model = PPO(
-            policy=model_config.get('policy', 'MlpPolicy'),
+        # Policy kwargs for LSTM
+        policy_kwargs = {
+            'net_arch': [512, 256, 128],
+            'activation_fn': torch.nn.Tanh,
+            'lstm_hidden_size': 256  # LSTM hidden units
+        }
+
+        logger.info("🧠 Using RecurrentPPO with LSTM for temporal learning")
+        logger.info(f"Net architecture: {policy_kwargs['net_arch']}")
+        logger.info(f"LSTM hidden size: {policy_kwargs['lstm_hidden_size']}")
+        logger.info(f"n_steps: {ppo_params['n_steps']}, batch_size: {ppo_params['batch_size']}")
+
+        # Create RecurrentPPO model
+        self.model = RecurrentPPO(
+            policy="MlpLstmPolicy",  # LSTM-based policy for time-series
             env=self.env,
-            learning_rate=ppo_params.get('learning_rate', 3e-4),
+            learning_rate=ppo_params.get('learning_rate', 1e-4),
             n_steps=ppo_params.get('n_steps', 2048),
             batch_size=ppo_params.get('batch_size', 64),
             n_epochs=ppo_params.get('n_epochs', 10),
@@ -296,7 +520,7 @@ class ForexTrainer:
             gae_lambda=ppo_params.get('gae_lambda', 0.95),
             clip_range=ppo_params.get('clip_range', 0.2),
             clip_range_vf=ppo_params.get('clip_range_vf'),
-            ent_coef=ppo_params.get('ent_coef', 0.01),
+            ent_coef=ppo_params.get('ent_coef', 0.15),  # CRITICAL: Use 0.15 to force exploration
             vf_coef=ppo_params.get('vf_coef', 0.5),
             max_grad_norm=ppo_params.get('max_grad_norm', 0.5),
             target_kl=ppo_params.get('target_kl'),
@@ -308,9 +532,9 @@ class ForexTrainer:
         # Set custom logger
         self.model.set_logger(self.sb3_logger)
 
-        logger.info("PPO model created successfully")
-        logger.info(f"Policy network: {policy_kwargs}")
-        logger.info(f"Learning rate: {ppo_params.get('learning_rate', 3e-4)}")
+        logger.info("✅ RecurrentPPO model with LSTM created successfully")
+        logger.info(f"Policy: MlpLstmPolicy (temporal learning enabled)")
+        logger.info(f"Learning rate: {ppo_params.get('learning_rate', 1e-4)}")
 
         return self.model
 
@@ -320,7 +544,9 @@ class ForexTrainer:
 
         # Evaluation callback
         if self.val_data:
-            eval_env = self.create_environment(self.val_data, is_training=False)
+            # IMPORTANT: eval_env must be wrapped the SAME way as training env
+            # But we pass is_training=True to ensure VecNormalize is applied
+            eval_env = self.create_environment(self.val_data, is_training=True)
             eval_callback = EvalCallback(
                 eval_env,
                 best_model_save_path=self.config['training'].get('model_save_path', './models/checkpoints'),
@@ -342,15 +568,15 @@ class ForexTrainer:
         )
         callbacks.append(checkpoint_callback)
 
-        # Custom forex callback
-        forex_callback = ForexTrainingCallback(self.config, verbose=1)
-        callbacks.append(forex_callback)
+        # Enhanced forex analytics callback
+        self.forex_callback = EnhancedForexCallback(self.config, verbose=1)
+        callbacks.append(self.forex_callback)
 
         logger.info(f"Callbacks created: {len(callbacks)} callbacks")
         return CallbackList(callbacks)
 
-    def train(self, csv_files: Optional[Dict[str, str]] = None):
-        """Execute complete training pipeline."""
+    def train(self, csv_files: Optional[Dict[str, str]] = None, resume_from: Optional[str] = None):
+        """Execute complete training pipeline with checkpointing support."""
         logger.info("🚀 Starting PPO training for Forex Trading System")
         start_time = time.time()
 
@@ -358,32 +584,55 @@ class ForexTrainer:
             # Prepare data
             self.prepare_data(csv_files)
 
-            # Create model
-            self.create_model()
+            # Create or load model
+            if resume_from and Path(resume_from).exists():
+                self.load_checkpoint(resume_from)
+                logger.info(f"🔄 Resumed from checkpoint: {resume_from}")
+            else:
+                self.create_model()
+                logger.info("🆕 Created new model")
 
-            # Create callbacks
+            # Create callbacks with checkpointing
             callbacks = self.create_callbacks()
 
-            # Get training parameters
+            # Training in 200k step chunks
+            chunk_size = 200000
             total_timesteps = self.config['algorithm'].get('total_timesteps', 500000)
-            log_interval = self.config['training'].get('log_frequency', 100)
+            chunks_needed = (total_timesteps + chunk_size - 1) // chunk_size  # Ceiling division
 
-            logger.info(f"🎯 Training target: ${self.config['evaluation']['forex_metrics']['target_profit_per_trade']} "
-                       f"in {self.config['evaluation']['forex_metrics']['target_duration_candles']} candles")
-            logger.info(f"📊 Total timesteps: {total_timesteps:,}")
-            logger.info(f"🔄 Expected time: 12-24 hours on GPU")
+            current_timesteps = getattr(self.model, 'num_timesteps', 0)
+            chunk_num = (current_timesteps // chunk_size) + 1
 
-            # Start training
-            self.model.learn(
-                total_timesteps=total_timesteps,
-                callback=callbacks,
-                log_interval=log_interval,
-                progress_bar=True
-            )
+            logger.info(f"📊 Training plan: {chunks_needed} chunks of {chunk_size:,} steps each")
+            logger.info(f"🎯 Starting from chunk {chunk_num} (timestep {current_timesteps:,})")
+
+            # Train in chunks
+            while current_timesteps < total_timesteps:
+                remaining_steps = min(chunk_size, total_timesteps - current_timesteps)
+
+                logger.info(f"🏃 Training chunk {chunk_num}/{chunks_needed}: {remaining_steps:,} steps")
+
+                # Train for this chunk
+                self.model.learn(
+                    total_timesteps=remaining_steps,
+                    callback=callbacks,
+                    log_interval=self.config['training'].get('log_frequency', 100),
+                    progress_bar=True,
+                    reset_num_timesteps=False
+                )
+
+                # Save checkpoint after each chunk
+                checkpoint_path = self.save_checkpoint(chunk_num)
+                current_timesteps = self.model.num_timesteps
+
+                logger.info(f"✅ Chunk {chunk_num} completed - Total: {current_timesteps:,} steps")
+                logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+
+                chunk_num += 1
 
             # Training completed
             training_time = time.time() - start_time
-            logger.info(f"✅ Training completed in {training_time/3600:.2f} hours")
+            logger.info(f"✅ Full training completed in {training_time/3600:.2f} hours")
 
             # Save final model
             self.save_final_model()
@@ -393,6 +642,12 @@ class ForexTrainer:
 
         except Exception as e:
             logger.error(f"❌ Training failed: {str(e)}")
+            # Save emergency checkpoint
+            try:
+                emergency_path = self.save_checkpoint(f"emergency_{int(time.time())}")
+                logger.info(f"💾 Emergency checkpoint saved: {emergency_path}")
+            except:
+                pass
             raise
 
     def save_final_model(self):
@@ -478,6 +733,88 @@ class ForexTrainer:
         else:
             logger.info(f"📈 Targets: Reward≥{target_reward}, WinRate≥{target_win_rate:.1f}%")
 
+    def save_checkpoint(self, chunk_num: int) -> str:
+        """Save training checkpoint with comprehensive analytics."""
+        checkpoint_dir = Path("./models/checkpoints")
+        analytics_dir = Path("./analytics")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        analytics_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create timestamped checkpoint filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = checkpoint_dir / f"forex_ppo_chunk_{chunk_num}_{timestamp}"
+
+        # Save model
+        self.model.save(checkpoint_path)
+
+        # Export and save analytics
+        if hasattr(self, 'forex_callback'):
+            # Export analytics summary
+            analytics = self.forex_callback.export_analytics(chunk_num)
+            analytics_path = analytics_dir / f"analytics_chunk_{chunk_num}_{timestamp}.json"
+            with open(analytics_path, 'w') as f:
+                import json
+                json.dump(analytics, f, indent=2, default=str)
+
+            # Export detailed trades CSV
+            trades_df = self.forex_callback.export_detailed_trades(chunk_num)
+            if not trades_df.empty:
+                trades_path = analytics_dir / f"trades_chunk_{chunk_num}_{timestamp}.csv"
+                trades_df.to_csv(trades_path, index=False)
+                logger.info(f"📊 Analytics exported: {len(trades_df)} trades")
+
+        # Save metadata
+        metadata = {
+            'chunk_number': chunk_num,
+            'total_timesteps': self.model.num_timesteps,
+            'timestamp': timestamp,
+            'training_started': datetime.now().isoformat(),
+            'config': self.config
+        }
+
+        if hasattr(self, 'forex_callback'):
+            metadata.update({
+                'total_trades': self.forex_callback.total_trades,
+                'win_rate': (self.forex_callback.winning_trades / max(self.forex_callback.total_trades, 1)) * 100,
+                'profit_factor': self.forex_callback.total_profit / max(abs(self.forex_callback.total_loss), 1),
+                'max_drawdown': self.forex_callback.max_drawdown,
+                'goal_trades': len(self.forex_callback.successful_goal_trades)
+            })
+
+        metadata_path = f"{checkpoint_path}_metadata.yaml"
+        with open(metadata_path, 'w') as f:
+            yaml.dump(metadata, f, default_flow_style=False)
+
+        logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+        logger.info(f"📈 Performance: {metadata.get('total_trades', 0)} trades, "
+                   f"{metadata.get('win_rate', 0):.1f}% win rate")
+        return str(checkpoint_path)
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load training checkpoint and restore state."""
+        if not Path(checkpoint_path).exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        # Prepare data if not already done
+        if self.train_data is None:
+            self.prepare_data()
+
+        # Create environment
+        self.env = self.create_environment(self.train_data, is_training=True)
+
+        # Load model
+        self.model = PPO.load(checkpoint_path, env=self.env)
+
+        # Load metadata if available
+        metadata_path = f"{checkpoint_path}_metadata.yaml"
+        if Path(metadata_path).exists():
+            with open(metadata_path, 'r') as f:
+                metadata = yaml.safe_load(f)
+            logger.info(f"📊 Loaded checkpoint from chunk {metadata.get('chunk_number', '?')}")
+            logger.info(f"🕐 Previously trained: {metadata.get('total_timesteps', 0):,} steps")
+
+        logger.info("✅ Checkpoint loaded successfully")
+
     def load_and_continue_training(self, model_path: str, additional_steps: int = 100000):
         """Load existing model and continue training."""
         logger.info(f"Loading model from {model_path}")
@@ -505,8 +842,34 @@ class ForexTrainer:
         self.save_final_model()
 
 
-def main(csv_files: Optional[Dict[str, str]] = None):
-    """Main training function for Google Colab."""
+def find_latest_checkpoint() -> Optional[str]:
+    """Find the latest checkpoint file for resuming training."""
+    checkpoint_dir = Path("./models/checkpoints")
+    if not checkpoint_dir.exists():
+        return None
+
+    # Find all checkpoint files
+    checkpoint_files = list(checkpoint_dir.glob("forex_ppo_chunk_*"))
+    if not checkpoint_files:
+        return None
+
+    # Sort by chunk number and timestamp to get the latest
+    def get_sort_key(path):
+        name = path.stem
+        parts = name.split('_')
+        try:
+            chunk_num = int(parts[3])  # forex_ppo_chunk_X_timestamp
+            timestamp = parts[4] + '_' + parts[5]  # YYYYMMDD_HHMMSS
+            return (chunk_num, timestamp)
+        except (IndexError, ValueError):
+            return (0, "")
+
+    latest_checkpoint = max(checkpoint_files, key=get_sort_key)
+    return str(latest_checkpoint)
+
+
+def main(csv_files: Optional[Dict[str, str]] = None, resume_from: Optional[str] = None):
+    """Main training function for Google Colab with checkpoint support."""
     print("🚀 Forex Trading System - PPO Training")
     print("=" * 50)
 
@@ -518,6 +881,21 @@ def main(csv_files: Optional[Dict[str, str]] = None):
     else:
         print("⚠️ No GPU detected - training will be very slow")
 
+    # Check for existing checkpoints if not resuming from specific file
+    if not resume_from:
+        latest_checkpoint = find_latest_checkpoint()
+        if latest_checkpoint:
+            print(f"🔍 Found existing checkpoint: {latest_checkpoint}")
+            response = input("Resume from this checkpoint? (y/n): ").lower().strip()
+            if response in ['y', 'yes']:
+                resume_from = latest_checkpoint
+
+    # Show training mode
+    if resume_from:
+        print(f"🔄 RESUMING training from: {resume_from}")
+    else:
+        print("🆕 STARTING new training session")
+
     # Show data source
     if csv_files:
         print("📊 Using custom CSV data files:")
@@ -526,24 +904,36 @@ def main(csv_files: Optional[Dict[str, str]] = None):
     else:
         print("📊 Using generated sample data (fallback)")
 
+    print("\n⚠️ Training will save checkpoints every 200k steps")
+    print("💾 Download checkpoint files after each chunk completes!")
+
     # Initialize trainer
     try:
         trainer = ForexTrainer()
 
-        # Start training
-        trainer.train(csv_files)
+        # Start training (new or resumed)
+        trainer.train(csv_files, resume_from=resume_from)
 
         print("\n🎉 Training completed successfully!")
         print("📥 Download the model files from:")
         print("   - ./models/final/forex_ppo_model.zip")
         print("   - ./models/final/forex_ppo_model_config.yaml")
+        print("   - ./models/checkpoints/ (all checkpoint files)")
 
     except KeyboardInterrupt:
         print("\n⏹️ Training interrupted by user")
+        print("💾 Emergency checkpoint should be available in ./models/checkpoints/")
     except Exception as e:
         print(f"\n❌ Training failed: {str(e)}")
+        print("💾 Emergency checkpoint should be available in ./models/checkpoints/")
         import traceback
         traceback.print_exc()
+
+
+def resume_training_from_file(checkpoint_file: str, csv_files: Optional[Dict[str, str]] = None):
+    """Helper function to resume training from a specific checkpoint file."""
+    print(f"🔄 Resuming training from: {checkpoint_file}")
+    return main(csv_files, resume_from=checkpoint_file)
 
 
 if __name__ == "__main__":
