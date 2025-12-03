@@ -1,36 +1,106 @@
 # Environment Configuration for Forex RL Trading System
-# Reward function settings - CRITICAL for "$100 in 4 candles" goal
 
 environment:
   name: "MultiPairForexEnv"
   currency_pairs:
     - "EURUSD"
-    - "GBPUSD"
+    - "AUDCHF"
     - "USDJPY"
-
-  timeframe: "M15"  # 15-minute candles
-  target_candles: 4  # Goal: profit in 4 candles (1 hour)
-  target_profit: 100.0  # Target profit in USD
+  timeframe: "M15"
 
 reward_function:
-  success_bonus: 500.0  # Large bonus for achieving $100 in 4 candles
-  profit_multiplier: 1.0  # Base reward for profits
-  loss_penalty: 3.0  # Penalty multiplier for losses
-  time_penalty: 0.1  # Small penalty for longer positions
+  # Tier 1: Exceptional trades
+  primary_goal:
+    profit_threshold: 37.50
+    duration_max: 12
+    bonus: 300.0
 
-action_space:
-  # 9 total actions: 3 per currency pair
-  actions_per_pair: 3  # HOLD, BUY, SELL
-  total_actions: 9
+  excellent_trade:
+    profit_threshold: 30.0
+    duration_max: 10
+    bonus: 200.0
 
+  good_trade:
+    profit_threshold: 22.50
+    duration_max: 8
+    bonus: 120.0
+
+  # Tier 2: Profitable trades
+  quick_profit:
+    profit_threshold: 15.0
+    duration_max: 6
+    bonus: 60.0
+
+  decent_profit:
+    profit_threshold: 10.0
+    base_bonus: 30.0
+    multiplier: 0.5
+
+  small_profit:
+    profit_threshold: 5.0
+    base_bonus: 15.0
+    multiplier: 0.3
+
+  # Tier 3-5: Losses (GRADUAL SCALING)
+  loss_penalties:
+    breakeven:
+      base_reward: 5.0
+
+    tiny_loss:
+      threshold: -10.0
+      base_reward: 2.0
+      multiplier: -0.2
+
+    small_loss:
+      threshold: -20.0
+      multiplier: -0.5
+
+    normal_loss:
+      threshold: -30.0
+      multiplier: -1.0
+
+    full_sl:
+      threshold: -40.0
+      multiplier: -1.5
+
+    large_loss:
+      threshold: -60.0
+      multiplier: -2.0
+      extra_penalty: 20.0
+
+    catastrophic:
+      multiplier: -2.5
+      extra_penalty: 50.0
+
+  # Activity rewards
+  activity:
+    enabled: true
+    base_trade_reward: 10.0              # Increased from 3.0 to encourage trading
+    favorable_session_bonus: 5.0         # Increased from 2.0 for better exploration
+    position_discipline_bonus: 2.0
+    overtrading_penalty_per_trade: 2.0
+    overtrading_threshold: 5
+
+# Position management (UPDATED)
 position_management:
   max_positions_per_pair: 1
-  stop_loss_pips: 50
-  take_profit_pips: 100
-  lot_size: 0.1
+  stop_loss_pips: 15.0
+  take_profit_pips: 22.5
+  max_position_duration: 20
+
+# Risk management (UPDATED)
+risk_management:
+  initial_balance: 1000.0
+  risk_per_trade_pct: 0.03
+  commission_per_lot: 1.0
+  dynamic_position_sizing: true
+
+action_space:
+  actions_per_pair: 3
+  total_actions: 9
 
 observation_space:
-  window_size: 20  # Number of historical candles
+  window_size: 20
   indicators:
     - "rsi"
     - "sma_10"

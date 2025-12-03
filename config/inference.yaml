@@ -27,7 +27,7 @@ ui_settings:
 
   # 3-column layout as specified
   layout:
-    pair_columns: 3  # EUR/USD, GBP/USD, USD/JPY
+    pair_columns: 3  # EUR/USD, AUD/CHF, USD/JPY
     show_confidence_bars: true
     show_real_time_charts: true
 

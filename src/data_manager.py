@@ -9,7 +9,7 @@ This module handles:
 - Data validation and visualization
 
 Key Features:
-- Multi-pair forex data (EUR/USD, GBP/USD, USD/JPY)
+- Multi-pair forex data (EUR/USD, AUD/CHF, USD/JPY)
 - 15+ technical indicators (RSI, MACD, SMA, EMA, ATR, etc.)
 - Real-time and historical data modes
 - Data quality validation
@@ -55,7 +55,7 @@ class DataManager:
     Comprehensive data manager for forex trading system.
 
     Handles data acquisition, preprocessing, indicator calculation,
-    and validation for EUR/USD, GBP/USD, and USD/JPY pairs.
+    and validation for EUR/USD, AUD/CHF, and USD/JPY pairs.
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -100,7 +100,7 @@ class DataManager:
         # Default configuration
         return {
             'data': {
-                'currency_pairs': ['EURUSD', 'GBPUSD', 'USDJPY'],
+                'currency_pairs': ['EURUSD', 'AUDCHF', 'USDJPY'],
                 'timeframe': '15M',
                 'history_days': 365,
                 'real_time': False
@@ -216,7 +216,7 @@ class DataManager:
 
         Args:
             csv_files: Dictionary mapping pair names to file paths
-                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'GBPUSD': 'data/GBPUSD_15M.csv'}
+                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'AUDCHF': 'data/AUDCHF_15M.csv'}
 
         Returns:
             Dictionary with loaded and processed data for each currency pair
@@ -229,11 +229,15 @@ class DataManager:
             try:
                 logger.info(f"Loading {pair} from {file_path}")
 
+                # First, peek at the file to understand its structure
+                self._log_csv_structure(file_path)
+
                 # Try to read CSV with different common formats
                 df = self._read_csv_flexible(file_path)
 
                 if df is None:
                     logger.error(f"Failed to load {pair} from {file_path}")
+                    logger.error("Expected CSV format: Date,Open,High,Low,Close,Volume")
                     continue
 
                 # Validate and process the data
@@ -257,108 +261,118 @@ class DataManager:
 
         return loaded_data
 
+    def _log_csv_structure(self, file_path: str) -> None:
+        """Log the structure of the CSV file for debugging."""
+        try:
+            with open(file_path, 'r') as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip()
+                logger.info(f"CSV structure preview:")
+                logger.info(f"  Header: {first_line}")
+                logger.info(f"  Sample: {second_line}")
+        except Exception as e:
+            logger.warning(f"Could not preview CSV structure: {e}")
+
     def _read_csv_flexible(self, file_path: str) -> Optional[pd.DataFrame]:
-        """Try different CSV reading approaches."""
-        read_attempts = [
-            # Common separators and date formats
-            {'sep': ',', 'parse_dates': [0], 'index_col': 0},
-            {'sep': ';', 'parse_dates': [0], 'index_col': 0},
-            {'sep': '\t', 'parse_dates': [0], 'index_col': 0},
-            {'sep': ',', 'parse_dates': [[0, 1]], 'index_col': 0},  # Separate date/time columns
-            {'sep': ','}  # No date parsing, will handle manually
-        ]
+        """Read 7-column tab-separated CSV files with proper datetime parsing."""
+        try:
+            # Handle 7-column tab-separated format: Time,Open,High,Low,Close,Volume,Extra
+            # Read only first 6 columns to ignore the extra column
+            df = pd.read_csv(file_path, sep='\t', usecols=[0,1,2,3,4,5])
 
-        for attempt in read_attempts:
-            try:
-                df = pd.read_csv(file_path, **attempt)
-                if len(df) > 100:  # Minimum viable dataset
-                    return df
-            except:
-                continue
+            # Set proper column names
+            df.columns = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
 
-        return None
+            # Parse Time column as datetime and set as index
+            df['Time'] = pd.to_datetime(df['Time'])
+            df.set_index('Time', inplace=True)
+            df.index.name = 'time'
+
+            # Convert numeric columns
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            logger.info(f"✅ CSV loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+            logger.info(f"Date range: {df.index.min()} to {df.index.max()}")
+
+            return df
+
+        except Exception as e:
+            logger.error(f"CSV reading failed: {e}")
+            return None
 
     def _process_csv_data(self, df: pd.DataFrame, pair: str) -> pd.DataFrame:
         """Process and standardize CSV data format."""
-        # Create a copy
-        df = df.copy()
+        try:
+            # Create a copy
+            df = df.copy()
 
-        # Standardize column names (case-insensitive)
-        df.columns = df.columns.str.strip().str.lower()
+            logger.info(f"Processing {pair}: {len(df)} rows, columns: {list(df.columns)}")
 
-        # Map common column name variations
-        column_mapping = {
-            'datetime': 'datetime',
-            'date': 'date',
-            'time': 'time',
-            'timestamp': 'datetime',
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'volume': 'Volume',
-            'vol': 'Volume',
-            'tick_volume': 'Volume'
-        }
-
-        # Rename columns
-        for old_col, new_col in column_mapping.items():
-            if old_col in df.columns:
-                df = df.rename(columns={old_col: new_col})
-
-        # Handle datetime index
-        if not isinstance(df.index, pd.DatetimeIndex):
-            if 'datetime' in df.columns:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                df.set_index('datetime', inplace=True)
-            elif 'date' in df.columns and 'time' in df.columns:
-                df['datetime'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
-                df.set_index('datetime', inplace=True)
-            elif 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'])
-                df.set_index('date', inplace=True)
+            # If datetime index already exists, we're good
+            if isinstance(df.index, pd.DatetimeIndex):
+                logger.info(f"✅ DateTime index already established: {df.index.min()} to {df.index.max()}")
             else:
-                # Try to use first column as datetime
-                df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-                df.set_index(df.columns[0], inplace=True)
-
-        # Ensure required OHLC columns exist
-        required_cols = ['Open', 'High', 'Low', 'Close']
-        for col in required_cols:
-            if col not in df.columns:
-                logger.error(f"Missing required column: {col}")
+                logger.error(f"No datetime index for {pair}")
                 return pd.DataFrame()
 
-        # Add Volume if missing (use tick volume approximation)
-        if 'Volume' not in df.columns:
-            df['Volume'] = np.random.lognormal(8, 0.5, len(df)).astype(int)
-            logger.info(f"Added synthetic volume data for {pair}")
+            # Ensure required OHLC columns exist (capitalize if needed)
+            if 'open' in df.columns:
+                df = df.rename(columns={'open': 'Open'})
+            if 'high' in df.columns:
+                df = df.rename(columns={'high': 'High'})
+            if 'low' in df.columns:
+                df = df.rename(columns={'low': 'Low'})
+            if 'close' in df.columns:
+                df = df.rename(columns={'close': 'Close'})
+            if 'volume' in df.columns:
+                df = df.rename(columns={'volume': 'Volume'})
 
-        # Add Symbol column
-        df['Symbol'] = pair
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            for col in required_cols:
+                if col not in df.columns:
+                    logger.error(f"Missing required column: {col}")
+                    return pd.DataFrame()
 
-        # Sort by datetime
-        df.sort_index(inplace=True)
+            # Add Volume if missing
+            if 'Volume' not in df.columns:
+                df['Volume'] = np.random.lognormal(8, 0.5, len(df)).astype(int)
+                logger.info(f"Added synthetic volume data for {pair}")
 
-        # Remove invalid data
-        df = df.dropna(subset=required_cols)
+            # Add Symbol column
+            df['Symbol'] = pair
 
-        # Validate OHLC relationships
-        invalid_rows = (
-            (df['High'] < df[['Open', 'Close']].max(axis=1)) |
-            (df['Low'] > df[['Open', 'Close']].min(axis=1)) |
-            (df['High'] < df['Low'])
-        )
+            # Sort by datetime
+            df.sort_index(inplace=True)
 
-        if invalid_rows.sum() > 0:
-            logger.warning(f"Removing {invalid_rows.sum()} rows with invalid OHLC data")
-            df = df[~invalid_rows]
+            # Convert to numeric
+            for col in required_cols + ['Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Convert to numeric
-        for col in required_cols + ['Volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Remove invalid data
+            df = df.dropna(subset=required_cols)
 
-        return df
+            # Basic OHLC validation - SIMPLIFIED
+            invalid_rows = (
+                (df['High'] < df['Low']) |  # High must be >= Low
+                (df['High'] <= 0) |
+                (df['Low'] <= 0) |
+                (df['Open'] <= 0) |
+                (df['Close'] <= 0)
+            )
+
+            if invalid_rows.sum() > 0:
+                invalid_count = invalid_rows.sum()
+                logger.warning(f"Removing {invalid_count} rows with basic validation issues")
+                df = df[~invalid_rows]
+
+            logger.info(f"✅ Successfully processed {pair}: {len(df)} valid candles")
+            return df
+
+        except Exception as e:
+            logger.error(f"Error processing {pair}: {e}")
+            return pd.DataFrame()
 
     def load_sample_data(self) -> Dict[str, pd.DataFrame]:
         """
@@ -382,7 +396,7 @@ class DataManager:
         # Realistic forex price parameters
         pair_configs = {
             'EURUSD': {'base': 1.0800, 'volatility': 0.001, 'trend': 0.00001},
-            'GBPUSD': {'base': 1.2700, 'volatility': 0.0012, 'trend': -0.00002},
+            'AUDCHF': {'base': 0.6850, 'volatility': 0.0015, 'trend': -0.00001},
             'USDJPY': {'base': 150.00, 'volatility': 0.15, 'trend': 0.001}
         }
 
@@ -857,7 +871,7 @@ class DataManager:
         Args:
             days: Number of days of historical data (for MT5 or sample data)
             csv_files: Optional dictionary mapping pair names to CSV file paths
-                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'GBPUSD': 'data/GBPUSD_15M.csv'}
+                      e.g., {'EURUSD': 'data/EURUSD_15M.csv', 'AUDCHF': 'data/AUDCHF_15M.csv'}
 
         Returns:
             Dictionary with processed data for each currency pair

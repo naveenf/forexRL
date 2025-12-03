@@ -221,8 +221,8 @@ backup/
 ehthumbs.db
 Thumbs.db
 
-# Jupyter notebook outputs
-*.ipynb
+# Jupyter notebook outputs and checkpoints
+.ipynb_checkpoints/
 
 # TensorBoard logs
 runs/
@@ -249,6 +249,13 @@ test_*.py
 sample_*.py
 demo_*.py
 debug_*.py
+
+# Temporary documentation/fix notes
+*_FIXES*.md
+*_GUIDE*.md
+*SUMMARY*.md
+UPLOAD_GUIDE.md
+BUG_FIX_*.md
 
 # Temporary pickle files
 *.pkl

@@ -5,7 +5,7 @@ This module implements a custom gymnasium environment for forex trading
 that supports simultaneous trading across multiple currency pairs.
 
 Key Features:
-- Multi-pair trading (EUR/USD, GBP/USD, USD/JPY)
+- Multi-pair trading (EUR/USD, AUD/CHF, USD/JPY)
 - Custom reward function targeting $100 profit in 4 candles
 - Position management with Stop Loss / Take Profit
 - Realistic spread simulation and transaction costs
@@ -14,7 +14,7 @@ Key Features:
 Action Space:
 - 9 discrete actions: 3 per currency pair
 - Actions per pair: HOLD (0), BUY (1), SELL (2)
-- Example: [0, 1, 2] = HOLD EURUSD, BUY GBPUSD, SELL USDJPY
+- Example: [0, 1, 2] = HOLD EURUSD, BUY AUDCHF, SELL USDJPY
 
 Observation Space:
 - Market data: OHLCV + technical indicators per pair
@@ -31,6 +31,8 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum
 from datetime import datetime
+import yaml
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -107,26 +109,34 @@ class MultiPairForexEnv(gym.Env):
     def __init__(self,
                  data: Dict[str, pd.DataFrame],
                  pairs: List[str] = None,
-                 initial_balance: float = 10000.0,
+                 initial_balance: float = 10000.0,  # Realistic retail account
                  max_positions_per_pair: int = 1,
-                 lot_size: float = 0.1,  # Standard lot size
+                 lot_size: float = 0.01,  # Will be dynamically calculated
                  spread_pips: Dict[str, float] = None,
-                 sl_tp_pips: Tuple[float, float] = (20.0, 40.0),  # SL, TP in pips
-                 max_episode_steps: int = 1000,
-                 commission_per_lot: float = 3.0):
+                 sl_tp_pips: Tuple[float, float] = (15.0, 22.5),  # 1:1.5 risk/reward
+                 max_episode_steps: int = 1500,  # Longer episodes for patience
+                 commission_per_lot: float = 1.0,  # CHANGED from 3.0
+                 risk_per_trade_pct: float = 0.03,  # CHANGED from 0.05
+                 dynamic_position_sizing: bool = True,
+                 max_position_duration: int = 20,  # CHANGED from 24
+                 reward_config_path: Optional[str] = None):  # NEW
         """
         Initialize the multi-pair forex environment.
 
         Args:
             data: Dictionary of DataFrames with OHLCV + indicators for each pair
             pairs: List of currency pairs to trade (default: all pairs in data)
-            initial_balance: Starting account balance in USD
+            initial_balance: Starting account balance in USD (default: $1,000)
             max_positions_per_pair: Maximum concurrent positions per pair
-            lot_size: Trading lot size (0.1 = mini lot)
+            lot_size: Base lot size (will be dynamically calculated if dynamic_position_sizing=True)
             spread_pips: Dictionary of spread in pips for each pair
-            sl_tp_pips: Tuple of (stop_loss_pips, take_profit_pips)
-            max_episode_steps: Maximum steps per episode
-            commission_per_lot: Commission cost per lot traded
+            sl_tp_pips: Tuple of (stop_loss_pips, take_profit_pips) - default 1:1.5 ratio
+            max_episode_steps: Maximum steps per episode (default: 1500 for longer episodes)
+            commission_per_lot: Commission cost per lot traded (default: $1)
+            risk_per_trade_pct: Percentage of account to risk per trade (default: 3%)
+            dynamic_position_sizing: Enable dynamic position sizing based on account risk
+            max_position_duration: Maximum position duration in candles (default: 20 = 5 hours)
+            reward_config_path: Path to YAML config file for reward function (default: config/environment.yaml)
         """
         super().__init__()
 
@@ -135,9 +145,15 @@ class MultiPairForexEnv(gym.Env):
         self.pairs = pairs or list(data.keys())
         self.initial_balance = initial_balance
         self.max_positions_per_pair = max_positions_per_pair
-        self.lot_size = lot_size
+        self.base_lot_size = lot_size
         self.max_episode_steps = max_episode_steps
         self.commission_per_lot = commission_per_lot
+
+        # Risk management parameters
+        self.risk_per_trade_pct = risk_per_trade_pct
+        self.dynamic_position_sizing = dynamic_position_sizing
+        self.max_position_duration = max_position_duration
+        self.position_durations = {'profitable': [], 'losing': []}  # Track for optimization
 
         # Validate pairs
         for pair in self.pairs:
@@ -166,6 +182,9 @@ class MultiPairForexEnv(gym.Env):
 
         # Initialize state variables
         self.reset()
+
+        # Load reward configuration
+        self.reward_config = self._load_reward_config(reward_config_path)
 
     def _setup_observation_space(self):
         """Setup the observation space based on available data features."""
@@ -206,6 +225,46 @@ class MultiPairForexEnv(gym.Env):
         logger.info(f"  - Global features: {global_features}")
         logger.info(f"  - Time features: {time_features}")
 
+    def _load_reward_config(self, config_path: Optional[str] = None) -> Dict:
+        """Load reward function configuration from YAML."""
+        if config_path is None:
+            config_path = "config/environment.yaml"
+
+        if Path(config_path).exists():
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                return config.get('reward_function', {})
+
+        return self._get_default_reward_config()
+
+    def _get_default_reward_config(self) -> Dict:
+        """Default reward configuration."""
+        return {
+            'primary_goal': {'profit_threshold': 37.50, 'duration_max': 12, 'bonus': 300.0},
+            'excellent_trade': {'profit_threshold': 30.0, 'duration_max': 10, 'bonus': 200.0},
+            'good_trade': {'profit_threshold': 22.50, 'duration_max': 8, 'bonus': 120.0},
+            'quick_profit': {'profit_threshold': 15.0, 'duration_max': 6, 'bonus': 60.0},
+            'decent_profit': {'profit_threshold': 10.0, 'base_bonus': 30.0, 'multiplier': 0.5},
+            'small_profit': {'profit_threshold': 5.0, 'base_bonus': 15.0, 'multiplier': 0.3},
+            'loss_penalties': {
+                'breakeven': {'base_reward': 5.0},
+                'tiny_loss': {'threshold': -10.0, 'base_reward': 2.0, 'multiplier': -0.2},
+                'small_loss': {'threshold': -20.0, 'multiplier': -0.5},
+                'normal_loss': {'threshold': -30.0, 'multiplier': -1.0},
+                'full_sl': {'threshold': -40.0, 'multiplier': -1.5},
+                'large_loss': {'threshold': -60.0, 'multiplier': -2.0, 'extra_penalty': 20.0},
+                'catastrophic': {'multiplier': -2.5, 'extra_penalty': 50.0}
+            },
+            'activity': {
+                'enabled': True,
+                'base_trade_reward': 3.0,
+                'favorable_session_bonus': 2.0,
+                'position_discipline_bonus': 2.0,
+                'overtrading_penalty_per_trade': 2.0,
+                'overtrading_threshold': 5
+            }
+        }
+
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """
         Reset the environment to initial state.
@@ -225,6 +284,8 @@ class MultiPairForexEnv(gym.Env):
         self.positions: Dict[str, List[Position]] = {pair: [] for pair in self.pairs}
         self.closed_positions: List[Position] = []
         self.total_commission_paid = 0.0
+        self.trade_summary_count = 0  # Track trades for summary logging
+        self.last_trade_info = {'trades_opened': [], 'trades_closed': [], 'failed_opens': []}  # Track for reward calculation
 
         # Episode statistics
         self.episode_stats = {
@@ -273,6 +334,7 @@ class MultiPairForexEnv(gym.Env):
 
         # Execute trading actions
         trade_info = self._execute_actions(action)
+        self.last_trade_info = trade_info  # Store for reward calculation
 
         # Update existing positions
         self._update_positions()
@@ -320,7 +382,7 @@ class MultiPairForexEnv(gym.Env):
         Returns:
             Dictionary with trade execution information
         """
-        trade_info = {'trades_opened': [], 'trades_closed': []}
+        trade_info = {'trades_opened': [], 'trades_closed': [], 'failed_opens': []}
 
         for i, (pair, action_int) in enumerate(zip(self.pairs, actions)):
             current_price = self._get_current_price(pair)
@@ -345,8 +407,10 @@ class MultiPairForexEnv(gym.Env):
 
             # Open new position
             if action in [ActionType.BUY, ActionType.SELL]:
+                logger.debug(f"Attempting to open {action.name} position for {pair} at ${current_price}")
                 position = self._open_position(pair, action, current_price)
                 if position:
+                    logger.info(f"✅ Opened {action.name} position: {pair} {position.size} lots at ${current_price}")
                     trade_info['trades_opened'].append({
                         'pair': pair,
                         'action': 'BUY' if action == ActionType.BUY else 'SELL',
@@ -355,8 +419,61 @@ class MultiPairForexEnv(gym.Env):
                         'sl': position.stop_loss,
                         'tp': position.take_profit
                     })
+                else:
+                    logger.debug(f"❌ Failed to open {action.name} position for {pair}")
+                    trade_info['failed_opens'].append({
+                        'pair': pair,
+                        'action': action.name
+                    })
 
         return trade_info
+
+    def _calculate_position_size(self, pair: str, stop_loss_pips: float) -> float:
+        """
+        Calculate position size based on account risk percentage.
+
+        Args:
+            pair: Currency pair
+            stop_loss_pips: Stop loss distance in pips
+
+        Returns:
+            Calculated lot size based on risk management
+        """
+        if not self.dynamic_position_sizing:
+            return self.base_lot_size
+
+        # Calculate account risk in USD
+        account_risk_usd = self.balance * self.risk_per_trade_pct
+
+        # Get pip value for this pair
+        pip_value = self._get_pip_value(pair)
+
+        # Calculate maximum lot size based on risk
+        if stop_loss_pips > 0:
+            max_lot_size = account_risk_usd / (stop_loss_pips * pip_value)
+
+            # Cap the lot size to reasonable limits for retail trading
+            max_lot_size = min(max_lot_size, 0.5)  # Maximum 0.5 standard lot (conservative)
+            max_lot_size = max(max_lot_size, 0.01)  # Minimum 0.01 lots (micro lot)
+
+            # Additional safety check for unrealistic calculations
+            if max_lot_size > 0.5:
+                logger.warning(f"Position size calculation unrealistic for {pair}: {max_lot_size:.3f} lots, capping to 0.5")
+                max_lot_size = 0.5
+
+            logger.debug(f"Calculated lot size for {pair}: {max_lot_size:.3f} "
+                        f"(Risk: ${account_risk_usd:.2f}, SL: {stop_loss_pips} pips, PipValue: ${pip_value})")
+
+            return round(max_lot_size, 3)
+        else:
+            return self.base_lot_size
+
+    def _get_pip_value(self, pair: str) -> float:
+        """Get pip value in USD for position sizing calculations."""
+        if 'JPY' in pair:
+            return 10.0  # For JPY pairs, 1 pip = 0.01, worth ~$10 per standard lot
+        else:
+            return 10.0  # For major pairs, 1 pip = 0.0001, worth ~$10 per standard lot
 
     def _open_position(self, pair: str, action: ActionType, current_price: float) -> Optional[Position]:
         """
@@ -388,11 +505,15 @@ class MultiPairForexEnv(gym.Env):
             stop_loss = entry_price + sl_distance
             take_profit = entry_price - tp_distance
 
-        # Check if we have enough balance (simplified risk management)
-        required_margin = self._calculate_required_margin(pair, self.lot_size)
-        if required_margin > self.balance * 0.1:  # Use max 10% of balance per trade
-            logger.warning(f"Insufficient balance for {pair} position")
+        # Calculate position size based on risk management
+        position_size = self._calculate_position_size(pair, self.sl_pips)
+
+        # Simplified margin check - just ensure balance > 0
+        if self.balance <= 100:  # Only block if nearly broke
+            logger.warning(f"Insufficient balance: ${self.balance:.2f}")
             return None
+
+        # No additional risk checks during training - let agent learn from outcomes
 
         # Create position
         position = Position(
@@ -400,7 +521,7 @@ class MultiPairForexEnv(gym.Env):
             action=action,
             entry_price=entry_price,
             entry_time=self.current_step,
-            size=self.lot_size,
+            size=position_size,
             stop_loss=stop_loss,
             take_profit=take_profit
         )
@@ -409,11 +530,18 @@ class MultiPairForexEnv(gym.Env):
         self.positions[pair].append(position)
 
         # Deduct commission
-        commission = self.commission_per_lot * self.lot_size
+        commission = self.commission_per_lot * position_size
         self.balance -= commission
         self.total_commission_paid += commission
 
-        logger.debug(f"Opened {pair} {action.name} position at {entry_price:.5f}")
+        # Increment trade counter for summary logging
+        self.trade_summary_count += 1
+
+        # Only log every 100 trades to reduce verbosity
+        if self.trade_summary_count % 100 == 0:
+            total_trades = self.episode_stats['total_trades']
+            win_rate = (self.episode_stats['winning_trades'] / max(total_trades, 1)) * 100
+            logger.info(f"Trade Summary - Completed {self.trade_summary_count} trades | Win Rate: {win_rate:.1f}% | Balance: ${self.balance:,.2f}")
         return position
 
     def _close_position(self, position: Position, current_price: float) -> float:
@@ -450,6 +578,7 @@ class MultiPairForexEnv(gym.Env):
         self.total_commission_paid += commission
 
         # Add to closed positions for reward calculation
+        position.close_time = self.current_step  # Track when it was closed
         self.closed_positions.append(position)
 
         # Update episode statistics
@@ -459,7 +588,7 @@ class MultiPairForexEnv(gym.Env):
         else:
             self.episode_stats['losing_trades'] += 1
 
-        logger.debug(f"Closed {position.pair} position - P&L: ${realized_pnl:.2f}")
+        # Silent individual trade closures - summary logging only
         return realized_pnl
 
     def _update_positions(self):
@@ -500,14 +629,21 @@ class MultiPairForexEnv(gym.Env):
                         elif current_price <= position.take_profit:
                             close_reason = "Take Profit"
 
-                # Check maximum duration (e.g., 24 hours = 96 candles)
-                if position.duration >= 96:
+                # Check maximum duration (configurable, default 24 candles = 6 hours)
+                if position.duration >= self.max_position_duration:
                     should_close = True
                     close_reason = "Max Duration"
 
                 if should_close:
                     positions_to_close.append(position)
                     pnl = self._close_position(position, current_price)
+
+                    # Track duration patterns for optimization
+                    if pnl > 0:
+                        self.position_durations['profitable'].append(position.duration)
+                    else:
+                        self.position_durations['losing'].append(position.duration)
+
                     closed_info.append({
                         'pair': pair,
                         'reason': close_reason,
@@ -523,64 +659,198 @@ class MultiPairForexEnv(gym.Env):
 
     def _calculate_reward(self) -> float:
         """
-        Calculate reward based on custom goal: $100 profit in 4 candles.
+        Improved reward function with immediate feedback - V5.
 
-        This is the core reward function that incentivizes the specific
-        trading objective of making $100 profit within 4 candles (1 hour).
+        Key Features:
+        - Immediate +2.0 reward when position opens successfully
+        - Large reward/penalty when position closes (uses sophisticated _calculate_trade_outcome_reward)
+        - Penalty for failed position opening attempts (-5.0)
+        - Small penalty for pure inaction (-0.5 per step)
 
-        Returns:
-            Calculated reward value
+        This solves PPO's credit assignment problem by providing immediate feedback.
         """
         reward = 0.0
 
-        # 1. Reward for achieving the main goal: $100 in 4 candles
-        recent_closed_positions = [pos for pos in self.closed_positions
-                                 if pos.entry_time >= self.current_step - 10]  # Recent trades
+        # 1. IMMEDIATE FEEDBACK: Reward for opening positions THIS STEP
+        recent_opened = [pos for pos in self._get_all_positions()
+                        if pos.entry_time == self.current_step]
 
-        for position in recent_closed_positions:
+        if len(recent_opened) > 0:
+            reward += 2.0 * len(recent_opened)  # Small bonus for each position opened
+            logger.debug(f"Step {self.current_step}: Opened {len(recent_opened)} positions → +{2.0 * len(recent_opened):.1f} reward")
+
+        # 2. OUTCOME FEEDBACK: Large reward/penalty when positions close
+        # Only reward positions that closed JUST NOW (this step or last step)
+        # Track via close_time which should be set when position closes
+        recent_closed = [pos for pos in self.closed_positions
+                        if hasattr(pos, 'close_time') and pos.close_time >= self.current_step - 1]
+
+        for position in recent_closed:
             profit = position.unrealized_pnl
-            duration = position.duration
+            duration = position.close_time - position.entry_time if hasattr(position, 'close_time') else 1
+            # Use the sophisticated reward function that was previously unused!
+            outcome_reward = self._calculate_trade_outcome_reward(profit, duration)
+            reward += outcome_reward
+            logger.debug(f"Step {self.current_step}: Closed position ${profit:.2f} in {duration} candles → {outcome_reward:+.1f} reward")
 
-            # BIG BONUS for achieving the goal
-            if profit >= 100.0 and duration <= 4:
-                reward += 500.0  # HUGE reward for achieving main goal
-                logger.info(f"GOAL ACHIEVED! ${profit:.2f} in {duration} candles - Bonus: +500")
+        # 3. PENALTY FOR FAILED POSITION OPENINGS
+        # Check if any BUY/SELL actions failed to open positions
+        failed_opens = self.last_trade_info.get('failed_opens', [])
+        if len(failed_opens) > 0:
+            penalty = -5.0 * len(failed_opens)
+            reward += penalty
+            logger.debug(f"Step {self.current_step}: {len(failed_opens)} failed opens → {penalty:.1f} reward")
 
-            # Scaled rewards for partial achievement
-            elif profit >= 50.0 and duration <= 4:
-                reward += 100.0  # Good progress toward goal
-            elif profit >= 100.0 and duration <= 8:
-                reward += 150.0  # Right profit amount, slower execution
-            elif profit > 0 and duration <= 4:
-                reward += 20.0 + (profit * 0.5)  # Quick profitable trades
-
-            # Penalties for losses
-            elif profit < 0:
-                reward -= abs(profit) * 2.0  # Penalty proportional to loss
-                if duration <= 4:
-                    reward -= 50.0  # Extra penalty for quick losses
-
-        # 2. Small positive reward for unrealized profits moving toward goal
-        total_unrealized = self._get_total_unrealized_pnl()
-        if total_unrealized > 50.0:
-            reward += 5.0
-        elif total_unrealized > 20.0:
-            reward += 2.0
-
-        # 3. Small penalty for holding too many positions (encourage focus)
-        total_positions = len(self._get_all_positions())
-        if total_positions > 3:
-            reward -= (total_positions - 3) * 2.0
-
-        # 4. Small penalty for excessive trading (commission costs)
-        if len(recent_closed_positions) > 5:
-            reward -= (len(recent_closed_positions) - 5) * 5.0
-
-        # 5. Balance protection penalty
-        if self.balance < self.initial_balance * 0.9:  # More than 10% drawdown
-            reward -= 20.0
+        # 4. SMALL PENALTY FOR PURE INACTION
+        # Discourage holding with no positions AND no recent trades
+        if len(self._get_all_positions()) == 0 and len(recent_closed) == 0:
+            reward -= 0.5  # Smaller, consistent penalty
 
         return reward
+
+    def _calculate_trade_outcome_reward(self, profit: float, duration: int) -> float:
+        """Calculate reward based on trade profit/loss with gradual scaling."""
+        cfg = self.reward_config
+
+        # Exceptional trades
+        primary = cfg.get('primary_goal', {})
+        if profit >= primary.get('profit_threshold', 37.50):
+            if duration <= primary.get('duration_max', 12):
+                logger.info(f"🎯 PRIMARY GOAL! ${profit:.2f} in {duration} candles")
+                return primary.get('bonus', 300.0)
+
+        excellent = cfg.get('excellent_trade', {})
+        if profit >= excellent.get('profit_threshold', 30.0):
+            if duration <= excellent.get('duration_max', 10):
+                return excellent.get('bonus', 200.0)
+
+        good = cfg.get('good_trade', {})
+        if profit >= good.get('profit_threshold', 22.50):
+            if duration <= good.get('duration_max', 8):
+                return good.get('bonus', 120.0)
+
+        # Profitable trades
+        quick = cfg.get('quick_profit', {})
+        if profit >= quick.get('profit_threshold', 15.0):
+            if duration <= quick.get('duration_max', 6):
+                return quick.get('bonus', 60.0)
+
+        decent = cfg.get('decent_profit', {})
+        if profit >= decent.get('profit_threshold', 10.0):
+            return decent.get('base_bonus', 30.0) + (profit * decent.get('multiplier', 0.5))
+
+        small = cfg.get('small_profit', {})
+        if profit >= small.get('profit_threshold', 5.0):
+            return small.get('base_bonus', 15.0) + (profit * small.get('multiplier', 0.3))
+
+        # GRADUAL LOSS SCALING (NO CLIFF!)
+        loss_cfg = cfg.get('loss_penalties', {})
+
+        if profit >= 0.0:
+            return loss_cfg.get('breakeven', {}).get('base_reward', 5.0)
+
+        tiny = loss_cfg.get('tiny_loss', {})
+        if profit >= tiny.get('threshold', -10.0):
+            base = tiny.get('base_reward', 2.0)
+            mult = tiny.get('multiplier', -0.2)
+            return base + (abs(profit) * mult)
+
+        small_loss = loss_cfg.get('small_loss', {})
+        if profit >= small_loss.get('threshold', -20.0):
+            return abs(profit) * small_loss.get('multiplier', -0.5)
+
+        normal = loss_cfg.get('normal_loss', {})
+        if profit >= normal.get('threshold', -30.0):
+            return abs(profit) * normal.get('multiplier', -1.0)
+
+        full_sl = loss_cfg.get('full_sl', {})
+        if profit >= full_sl.get('threshold', -40.0):
+            return abs(profit) * full_sl.get('multiplier', -1.5)
+
+        large = loss_cfg.get('large_loss', {})
+        if profit >= large.get('threshold', -60.0):
+            return (abs(profit) * large.get('multiplier', -2.0)) - large.get('extra_penalty', 20.0)
+
+        catastrophic = loss_cfg.get('catastrophic', {})
+        return (abs(profit) * catastrophic.get('multiplier', -2.5)) - catastrophic.get('extra_penalty', 50.0)
+
+    def _calculate_activity_reward(self, position: Position) -> float:
+        """Calculate reward for trading activity to encourage moderate trading."""
+        cfg = self.reward_config.get('activity', {})
+
+        if not cfg.get('enabled', True):
+            return 0.0
+
+        activity_reward = cfg.get('base_trade_reward', 3.0)
+
+        if self._is_favorable_session():
+            activity_reward += cfg.get('favorable_session_bonus', 2.0)
+
+        if len(self._get_all_positions()) <= 2:
+            activity_reward += cfg.get('position_discipline_bonus', 2.0)
+
+        threshold = cfg.get('overtrading_threshold', 5)
+        recent_trades = len([p for p in self.closed_positions
+                            if p.entry_time >= self.current_step - 20])
+
+        if recent_trades > threshold:
+            penalty_per_trade = cfg.get('overtrading_penalty_per_trade', 2.0)
+            activity_reward -= (recent_trades - threshold) * penalty_per_trade
+
+        return activity_reward
+
+    def _calculate_account_performance_reward(self) -> float:
+        """Calculate reward based on overall account performance."""
+        reward = 0.0
+        account_return = (self.balance - self.initial_balance) / self.initial_balance
+
+        if account_return > 0.05:
+            reward += 50.0
+        elif account_return > 0.02:
+            reward += 20.0
+
+        if account_return < -0.05:
+            reward -= 50.0
+        if account_return < -0.10:
+            reward -= 150.0
+
+        return reward
+
+    def _calculate_position_management_reward(self) -> float:
+        """Reward for good position management - penalize excessive positions only."""
+        reward = 0.0
+        total_positions = len(self._get_all_positions())
+
+        # ONLY penalize overtrading (>3 positions)
+        # Do NOT reward holding or low position counts
+        if total_positions > 3:
+            reward -= (total_positions - 3) * 10.0
+
+        return reward
+
+    def _calculate_unrealized_pnl_reward(self) -> float:
+        """Small influence from unrealized P&L."""
+        reward = 0.0
+        total_unrealized = self._get_total_unrealized_pnl()
+
+        if total_unrealized > 20.0:
+            reward += 10.0
+        elif total_unrealized < -30.0:
+            reward -= 15.0
+
+        return reward
+
+    def _is_favorable_session(self) -> bool:
+        """Check if current time is in favorable trading session."""
+        data_index = self.start_step + self.current_step
+        if data_index >= len(self.data[self.pairs[0]]):
+            data_index = len(self.data[self.pairs[0]]) - 1
+
+        timestamp = self.data[self.pairs[0]].index[data_index]
+        hour = timestamp.hour
+
+        # European session (8-16 GMT) and early American overlap
+        return (8 <= hour < 17)
 
     def _get_observation(self) -> np.ndarray:
         """
@@ -735,6 +1005,63 @@ class MultiPairForexEnv(gym.Env):
     def _get_equity(self) -> float:
         """Get current equity (balance + unrealized P&L)."""
         return self.balance + self._get_total_unrealized_pnl()
+
+    def _get_total_used_margin(self) -> float:
+        """Calculate total margin currently used by all open positions."""
+        total_margin = 0.0
+        for pair, positions in self.positions.items():
+            for position in positions:
+                total_margin += self._calculate_required_margin(pair, position.size)
+        return total_margin
+
+    def _get_available_margin(self) -> float:
+        """Get available margin for new positions."""
+        max_margin = self.balance * 0.8  # Use max 80% of balance for margin (allows more trading)
+        used_margin = self._get_total_used_margin()
+        available = max(0, max_margin - used_margin)
+        logger.debug(f"Margin check: max=${max_margin:.2f}, used=${used_margin:.2f}, available=${available:.2f}")
+        return available
+
+    def get_duration_insights(self) -> Dict:
+        """Get insights from collected duration data for optimization."""
+        insights = {}
+
+        profitable_durations = self.position_durations['profitable']
+        losing_durations = self.position_durations['losing']
+
+        if profitable_durations:
+            insights['profitable'] = {
+                'count': len(profitable_durations),
+                'mean': np.mean(profitable_durations),
+                'median': np.median(profitable_durations),
+                'p95': np.percentile(profitable_durations, 95),
+                'max': max(profitable_durations)
+            }
+
+        if losing_durations:
+            insights['losing'] = {
+                'count': len(losing_durations),
+                'mean': np.mean(losing_durations),
+                'median': np.median(losing_durations),
+                'p95': np.percentile(losing_durations, 95),
+                'max': max(losing_durations)
+            }
+
+        # Suggest optimal duration
+        if profitable_durations and losing_durations:
+            prof_mean = np.mean(profitable_durations)
+            prof_p95 = np.percentile(profitable_durations, 95)
+
+            # Conservative approach: capture 95% of profitable trades
+            optimal_duration = max(8, min(int(prof_p95), 20))  # Between 8-20 candles
+
+            insights['suggestion'] = {
+                'optimal_duration': optimal_duration,
+                'current_duration': self.max_position_duration,
+                'reasoning': f"Captures 95% of profitable trades ({prof_p95:.1f} candles), capped at 20"
+            }
+
+        return insights
 
     def _is_terminated(self) -> bool:
         """Check if episode should be terminated."""

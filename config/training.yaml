@@ -11,37 +11,38 @@ algorithm:
 # Model Configuration
 model:
   name: "google/gemma-2b-it"  # Gemma 2B model
-  policy: "MlpPolicy"
+  policy: "MlpLstmPolicy"  # Changed from MlpPolicy - LSTM for temporal learning
   policy_kwargs:
     net_arch:
       - 512  # Hidden layer size
       - 256
       - 128
     activation_fn: "tanh"
+    lstm_hidden_size: 256  # LSTM hidden units
 
-# PPO Hyperparameters (Optimized for Forex)
+# PPO Hyperparameters (Optimized for LSTM)
 ppo_params:
-  learning_rate: 3e-4        # Adaptive learning rate
-  n_steps: 2048              # Steps per environment per update
-  batch_size: 64             # Mini-batch size
+  learning_rate: 0.0001      # Learning rate (1e-4) - Reduced for stability
+  n_steps: 2048              # Reduced from 4096 for LSTM (memory intensive)
+  batch_size: 64             # Reduced from 128 for LSTM
   n_epochs: 10               # Epochs per update
   gamma: 0.99                # Discount factor
   gae_lambda: 0.95           # GAE lambda
   clip_range: 0.2            # PPO clipping parameter
   clip_range_vf: null        # Value function clipping
-  ent_coef: 0.01             # Entropy coefficient
+  ent_coef: 0.15             # Tripled for exploration - forces BUY/SELL action discovery
   vf_coef: 0.5               # Value function coefficient
   max_grad_norm: 0.5         # Gradient clipping
   target_kl: null            # Target KL divergence
   normalize_advantage: true
 
-# Training Configuration
+# Training Configuration - Realistic Targets
 training:
   # Data splits
   validation_split: 0.2
 
   # Saving and logging
-  save_frequency: 25000      # Save model every 25k steps
+  save_frequency: 50000      # Save model every 50k steps (chunk intervals)
   log_frequency: 100         # Log metrics every 100 steps
   eval_frequency: 10000      # Evaluate every 10k steps
 
@@ -49,33 +50,39 @@ training:
   model_save_path: "./models/checkpoints"
   tensorboard_log: "./logs/tensorboard"
   eval_log_path: "./logs/evaluations"
+  analytics_path: "./analytics"  # Analytics export directory
 
-  # Target metrics for training validation
-  target_episode_reward: 1000.0   # Target episode reward
-  target_win_rate: 0.65           # Target 65% win rate
-  early_stopping_patience: 5      # Stop if no improvement for 5 evaluations
-  min_reward_threshold: 500.0     # Minimum reward threshold
+  # Realistic target metrics
+  target_episode_reward: 300.0    # Increased from 200 (activity rewards)
+  target_win_rate: 0.42           # More realistic
+  target_profit_factor: 1.6      # Gross profit / gross loss
+  target_trades_per_episode: 15  # NEW: Monitor activity
+  min_trades_per_episode: 5      # NEW: Minimum acceptable
+  early_stopping_patience: 10    # More patience for realistic strategy
+  min_reward_threshold: 50.0     # Lower minimum threshold
+  max_drawdown_limit: 0.10       # Stop if >10% drawdown
 
-# Environment Configuration
+# Environment Configuration - Simplified Single-Pair Strategy
 environment:
-  # Trading parameters
-  initial_balance: 10000.0
+  # Trading parameters - 3% risk strategy
+  initial_balance: 10000.0          # Realistic retail account size
+  risk_per_trade_pct: 0.03         # 3% risk per trade ($300 max loss)
+  dynamic_position_sizing: true     # Enable risk-based position sizing
   max_positions_per_pair: 1
-  lot_size: 0.1
-  max_episode_steps: 1000
-  commission_per_lot: 3.0
+  lot_size: 0.01                   # Base lot size (will be calculated dynamically)
+  max_episode_steps: 1500          # Longer episodes for patience
+  max_position_duration: 24        # Max 6 hours per position (24 candles)
+  commission_per_lot: 0.5
 
-  # Currency pairs
-  pairs: ["EURUSD", "AUDCHF", "USDJPY"]
+  # Currency pairs - SIMPLIFIED: Single pair only
+  pairs: ["USDJPY"]
 
   # Spread configuration (pips)
   spread_pips:
-    EURUSD: 1.5
-    AUDCHF: 2.5
     USDJPY: 1.8
 
-  # Stop Loss / Take Profit (pips)
-  sl_tp_pips: [20.0, 40.0]  # [stop_loss, take_profit]
+  # Stop Loss / Take Profit (pips) - 1:1.5 risk/reward ratio
+  sl_tp_pips: [15.0, 22.5]  # [stop_loss, take_profit]
 
 # Data Configuration
 data:
@@ -89,24 +96,26 @@ data:
   outlier_clipping: true
   outlier_std_threshold: 3.0
 
-# Evaluation Configuration
+# Evaluation Configuration - Realistic Targets
 evaluation:
   episodes: 50  # Number of evaluation episodes
   deterministic: true  # Use deterministic policy for evaluation
 
-  # Success metrics
+  # Realistic success metrics
   target_metrics:
-    episode_reward: 1000.0
-    win_rate: 0.65
-    profit_factor: 1.5
-    sharpe_ratio: 1.0
-    max_drawdown: 0.15
+    episode_reward: 200.0      # Realistic target (was 1000)
+    win_rate: 0.45            # 45% achievable with 1:1.5 ratio
+    profit_factor: 1.5        # Gross profit / gross loss
+    sharpe_ratio: 0.8         # Risk-adjusted returns
+    max_drawdown: 0.10        # 10% maximum drawdown
 
-  # Specific forex metrics
+  # Specific forex metrics - Updated Strategy
   forex_metrics:
-    target_profit_per_trade: 100.0    # $100 target
-    target_duration_candles: 4        # 4 candles max
-    successful_trades_threshold: 5     # Success if >=5 goal trades
+    target_profit_per_trade: 37.50   # $37.50 target (7.5% account return)
+    target_duration_candles: 12      # 12 candles max (3 hours)
+    successful_trades_threshold: 3   # Success if >=3 goal trades per episode
+    min_profit_per_trade: 15.0      # Minimum $15 profit considered good
+    max_loss_per_trade: 35.0        # Maximum $35 loss before penalty
 
 # Callbacks Configuration
 callbacks:
