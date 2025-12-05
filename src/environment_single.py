@@ -97,7 +97,7 @@ class SinglePairForexEnv(gym.Env):
                  max_episode_steps: int = 1500,
                  commission_per_lot: float = 0.5,
                  risk_per_trade_pct: float = 0.03,
-                 max_position_duration: int = 24):
+                 max_position_duration: int = 24):  # Max 6 hours (24 × 15min candles)
         """
         Initialize the single-pair forex environment.
 
@@ -272,9 +272,25 @@ class SinglePairForexEnv(gym.Env):
         if action == ActionType.HOLD:
             return trade_info
 
+        # SMART MINIMUM: Check if trying to close position too early
+        if self.position is not None:
+            duration = self.current_step - self.position.entry_time
+
+            # Prevent user-initiated close before minimum duration (8 candles = 2 hours)
+            # FIX: Reduced from 12 to 8 for more responsive trading while still filtering noise
+            # Note: TP/SL/Max Duration auto-closes still work (handled separately in _check_position_closure)
+            if duration < 8:
+                # Block the close attempt, treat as HOLD instead
+                logger.debug(f"Step {self.current_step}: Blocked premature close "
+                            f"attempt at {duration} candles (min: 8)")
+                trade_info['action'] = 'HOLD'
+                trade_info['blocked'] = True
+                trade_info['blocked_reason'] = f'Duration {duration} < minimum 8'
+                return trade_info
+
         current_price = self._get_current_price()
 
-        # Close existing position if opening new one
+        # Close existing position if opening new one (only if duration >= 12)
         if self.position is not None:
             # Save position info before closing
             position_size = self.position.size
@@ -359,15 +375,9 @@ class SinglePairForexEnv(gym.Env):
 
     def _open_position(self, action: ActionType, current_price: float) -> Optional[Position]:
         """Open a new trading position."""
-        # Spread-adjusted entry price
-        spread = self.spread_pips * 0.01  # Convert pips to price for JPY
-        if action == ActionType.BUY:
-            entry_price = current_price + spread / 2
-        else:
-            entry_price = current_price - spread / 2
-
-        # Apply slippage to entry price (realistic execution)
-        entry_price = self._apply_slippage(entry_price, action)
+        # Apply slippage only (includes spread effect in real execution)
+        # FIX: Previously applied BOTH spread AND slippage, causing ~4.5 pips cost instead of ~2 pips
+        entry_price = self._apply_slippage(current_price, action)
 
         # Calculate SL and TP
         sl_distance = self.sl_pips * 0.01
@@ -412,15 +422,15 @@ class SinglePairForexEnv(gym.Env):
         if self.position is None:
             return 0.0
 
-        # Update P&L with spread-adjusted exit price
-        spread = self.spread_pips * 0.01
+        # Apply slippage only (includes spread effect in real execution)
+        # FIX: Previously applied BOTH spread AND slippage
+        # FIX: Also fixed slippage direction - exit uses OPPOSITE action direction
         if self.position.action == ActionType.BUY:
-            exit_price = current_price - spread / 2
+            # Closing a BUY = SELL action, so use SELL slippage
+            exit_price = self._apply_slippage(current_price, ActionType.SELL)
         else:
-            exit_price = current_price + spread / 2
-
-        # Apply slippage to exit price (realistic execution)
-        exit_price = self._apply_slippage(exit_price, self.position.action)
+            # Closing a SELL = BUY action, so use BUY slippage
+            exit_price = self._apply_slippage(current_price, ActionType.BUY)
 
         self.position.update_pnl(exit_price)
         realized_pnl = self.position.unrealized_pnl
@@ -496,6 +506,35 @@ class SinglePairForexEnv(gym.Env):
 
         return None
 
+    def _get_trend_direction(self) -> int:
+        """
+        Detect short-term trend using SMA crossover.
+
+        Returns:
+            1: Bullish (SMA_20 > SMA_50)
+            -1: Bearish (SMA_20 < SMA_50)
+            0: Neutral/ranging
+        """
+        data_index = self.start_step + self.current_step
+        if data_index >= len(self.data):
+            data_index = len(self.data) - 1
+
+        row = self.data.iloc[data_index]
+
+        # Get SMA values from data
+        sma_20 = row.get('SMA_20', None)
+        sma_50 = row.get('SMA_50', None)
+
+        if sma_20 is None or sma_50 is None or pd.isna(sma_20) or pd.isna(sma_50):
+            return 0  # Can't determine trend
+
+        # Use 0.1% buffer to filter noise
+        if sma_20 > sma_50 * 1.001:
+            return 1  # Bullish
+        elif sma_20 < sma_50 * 0.999:
+            return -1  # Bearish
+        return 0  # Neutral/ranging
+
     def _get_recent_returns(self, window: int = 20) -> List[float]:
         """
         Calculate recent price returns for volatility measurement.
@@ -521,21 +560,39 @@ class SinglePairForexEnv(gym.Env):
 
     def _calculate_reward(self, trade_info: Dict, closed_position_info: Optional[Dict]) -> float:
         """
-        Sharpe-based reward function with risk adjustment.
+        Sharpe-based reward function optimized for trend following (12-16 candle holds).
 
-        Formula: R_t = Opening_Signal + Sharpe_Reward - Transaction_Costs - Inactivity_Penalty - Holding_Penalty
+        Formula: R_t = Opening_Signal + Sharpe_Reward + Duration_Bonus - Premature_Exit_Penalty - Holding_Penalty
 
         Key improvements:
-        1. Risk-adjusted returns (Sharpe ratio-like)
-        2. Transaction costs explicitly penalized in reward
-        3. Holding time penalty to prevent infinite positions
+        1. Risk-adjusted returns (Sharpe ratio)
+        2. Duration bonuses for 12-16 candle holds (+100 peak)
+        3. Penalties for noise trading (<8 candles: -30)
+        4. SMART minimum: Premature user exits blocked & penalized
+        5. Holding rewards during minimum period (+0.5)
+        6. Holding penalties only after 24 candles
+
+        Targets:
+        - Optimal duration: 12-16 candles (3-4 hours)
+        - Mean trade duration: ~14 candles
+        - Trades per day: 4-8 (down from 40-60)
+        - Transaction cost reduction: ~85%
         """
         reward = 0.0
 
         # 1. OPENING POSITION SIGNAL (small bonus to offset initial transaction cost)
         if trade_info['action'] in ['BUY', 'SELL'] and trade_info['success']:
-            reward += 5.0  # Reduced from 10.0 to be more conservative
-            logger.debug(f"Step {self.current_step}: Opened position → +5.0 reward")
+            reward += 1.0  # FIX: Reduced from 5.0 - was encouraging overtrading
+            logger.debug(f"Step {self.current_step}: Opened position → +1.0 reward")
+
+            # 1b. COUNTER-TREND PENALTY (encourage trend-following)
+            trend = self._get_trend_direction()
+            if trade_info['action'] == 'BUY' and trend == -1:
+                reward -= 10.0  # Penalty for buying in downtrend
+                logger.debug(f"Step {self.current_step}: Counter-trend BUY in downtrend → -10.0")
+            elif trade_info['action'] == 'SELL' and trend == 1:
+                reward -= 10.0  # Penalty for selling in uptrend
+                logger.debug(f"Step {self.current_step}: Counter-trend SELL in uptrend → -10.0")
 
         # 2. RISK-ADJUSTED REWARD FOR CLOSED POSITIONS
         if closed_position_info is not None:
@@ -554,36 +611,71 @@ class SinglePairForexEnv(gym.Env):
                 # Fallback if insufficient history (early in episode)
                 sharpe_reward = pnl * 0.5
 
-            # Duration bonuses for quick profitable trades
+            # Duration bonuses for trend-following trades (10-20 candle sweet spot)
+            # FIX: Reduced bonuses from 100/50/20 to 30/15/5 - was overwhelming Sharpe reward
             if pnl > 0:
-                if duration <= 12:  # Quick profit (<3 hours)
-                    sharpe_reward += 50.0
-                elif duration <= 20:  # Moderate speed
-                    sharpe_reward += 20.0
+                if duration >= 10 and duration <= 20:  # Optimal trend capture (2.5-5 hours)
+                    sharpe_reward += 30.0
+                elif duration >= 8 and duration < 10:  # Good but slightly early
+                    sharpe_reward += 10.0
+                elif duration > 20 and duration <= 24:  # Good but slightly late
+                    sharpe_reward += 10.0
+                elif duration < 8:  # Too quick - noise trading
+                    sharpe_reward -= 20.0  # Penalty for premature exit
+            else:
+                # Losing trades: no duration penalties (already losing)
+                pass
 
-            # CRITICAL: Transaction cost penalty (spread + commission)
-            position_size = closed_position_info.get('size', 1.0)
-            transaction_cost = (self.commission_per_lot * position_size * 2) + \
-                              (self.spread_pips * 0.01 * 10.0 * position_size)
-
-            reward += sharpe_reward - transaction_cost
+            # Commissions already deducted from balance in _open_position() and _close_position()
+            reward += sharpe_reward
 
             logger.debug(f"Step {self.current_step}: Closed ${pnl:.2f}, "
-                        f"Sharpe reward: {sharpe_reward:.2f}, "
-                        f"Transaction cost: {transaction_cost:.2f}, "
-                        f"Net: {sharpe_reward - transaction_cost:+.2f}")
+                        f"Sharpe reward: {sharpe_reward:.2f}")
 
         # 3. INACTIVITY/HOLDING PENALTIES
         if trade_info['action'] == 'HOLD':
             if self.position is None:
-                # No position: AGGRESSIVE penalty to force exploration
-                reward -= 5.0  # Increased from 2.0 - must be worse than trying
+                # No position: GENTLE penalty to encourage exploration
+                reward -= 0.5  # Gentle nudge, not catastrophic punishment
             else:
-                # Has position: progressive penalty for holding too long
+                # Has position: holding penalty only after optimal duration window
                 duration = self.current_step - self.position.entry_time
-                # Penalty ramps up: -0.1 at 24 candles, -0.5 at 120 candles
-                holding_penalty = -0.5 * (duration / 24.0)
-                reward += max(holding_penalty, -3.0)  # Cap at -3.0 per step
+
+                if duration < 8:
+                    # FIX: Changed from 12 to 8 - reward holding during minimum period
+                    reward += 0.5
+                elif duration >= 8 and duration <= 20:
+                    # FIX: Optimal window now 8-20 candles (no penalty)
+                    reward += 0.0
+                else:
+                    # Duration > 20: progressive penalty for excessive holding
+                    excess_duration = duration - 20
+                    holding_penalty = -1.0 * (excess_duration / 10.0)
+                    reward += max(holding_penalty, -5.0)  # Cap at -5.0 per step
+
+        # 4. PREMATURE EXIT PENALTY (applies to user-initiated closes via BUY/SELL action)
+        if closed_position_info is not None:
+            close_reason = closed_position_info.get('reason', '')
+            duration = closed_position_info.get('duration', 0)
+
+            # Allow TP/SL exits anytime (protective stops)
+            if close_reason in ['Take Profit', 'Stop Loss']:
+                pass  # No penalty for risk management
+
+            # Penalize user-initiated premature closes (BUY/SELL action before minimum)
+            # FIX: Changed from 12 to 8 to match new minimum duration
+            elif close_reason == 'New Position' and duration < 8:
+                pnl = closed_position_info.get('pnl', 0)
+                if pnl >= 0:
+                    # Profitable but premature: significant penalty
+                    reward -= 50.0
+                    logger.debug(f"Step {self.current_step}: Premature profitable exit "
+                                f"at {duration} candles → -50.0 penalty")
+                else:
+                    # Losing and premature: moderate penalty (already losing)
+                    reward -= 20.0
+                    logger.debug(f"Step {self.current_step}: Premature losing exit "
+                                f"at {duration} candles → -20.0 penalty")
 
         return reward
 

@@ -72,27 +72,30 @@ reward_function:
       multiplier: -2.5
       extra_penalty: 50.0
 
-  # Activity rewards
+  # Activity rewards (OPTIMIZED FOR TREND FOLLOWING)
   activity:
     enabled: true
-    base_trade_reward: 10.0              # Increased from 3.0 to encourage trading
-    favorable_session_bonus: 5.0         # Increased from 2.0 for better exploration
-    position_discipline_bonus: 2.0
-    overtrading_penalty_per_trade: 2.0
-    overtrading_threshold: 5
+    base_trade_reward: 5.0               # Reduced from 10.0 (less trading encouraged)
+    favorable_session_bonus: 5.0
+    position_discipline_bonus: 10.0      # Increased from 2.0 (reward patience)
+    overtrading_penalty_per_trade: 5.0   # Increased from 2.0
+    overtrading_threshold: 3             # Reduced from 5 (stricter overtrading check)
+    min_hold_duration: 8                 # FIX: Reduced from 12 to 8 candles (2 hours)
+    optimal_hold_range: [10, 20]         # FIX: Wider window 10-20 candles (2.5-5 hours)
 
 # Position management (UPDATED)
 position_management:
   max_positions_per_pair: 1
   stop_loss_pips: 15.0
   take_profit_pips: 22.5
-  max_position_duration: 20
+  max_position_duration: 24  # FIX: Max 6 hours (24 × 15min) - synced with training.yaml
+  min_position_duration: 8   # FIX: Reduced from 12 to 8 (2 hours min)
 
 # Risk management (UPDATED)
 risk_management:
-  initial_balance: 1000.0
+  initial_balance: 10000.0  # FIX: Synced with training.yaml (was 1000.0)
   risk_per_trade_pct: 0.03
-  commission_per_lot: 1.0
+  commission_per_lot: 0.5   # FIX: Synced with training.yaml (was 1.0)
   dynamic_position_sizing: true
 
 action_space:

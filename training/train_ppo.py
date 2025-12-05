@@ -165,12 +165,17 @@ class EnhancedForexCallback(BaseCallback):
                         self.episode_rewards.append(ep_info['r'])
                         self.total_episodes += 1
 
-                        # Track balance for drawdown calculation
+                        # Track balance for drawdown calculation (reset peak per episode)
                         current_balance = info.get('balance', 10000.0)
                         self.episode_balances.append(current_balance)
+
+                        # Reset peak balance for each new episode to track per-episode drawdown
+                        if len(self.episode_balances) == 1 or self.total_episodes == 0:
+                            self.peak_balance = 10000.0  # Reset to initial balance
+
                         self.peak_balance = max(self.peak_balance, current_balance)
 
-                        # Calculate drawdown
+                        # Calculate drawdown within this episode
                         if current_balance < self.peak_balance:
                             drawdown = (self.peak_balance - current_balance) / self.peak_balance
                             self.max_drawdown = max(self.max_drawdown, drawdown)
@@ -454,17 +459,17 @@ class ForexTrainer:
         # Vectorize environment (required for stable-baselines3)
         env = DummyVecEnv([lambda: env])
 
-        # Add VecNormalize for observation normalization ONLY (Fix: reward normalization was distorting signals)
+        # Add VecNormalize for observation and reward normalization
         if is_training:
             env = VecNormalize(
                 env,
                 norm_obs=True,       # Normalize observations (prices ~145 vs indicators 0-1)
-                norm_reward=False,   # DISABLED: Was causing massive reward distortion (episodes showing 9000+ reward)
+                norm_reward=True,    # ENABLED: Normalize rewards for stable learning
                 clip_obs=10.0,       # Clip normalized obs to [-10, 10]
-                clip_reward=10.0,    # Clip rewards to [-10, 10] without normalization
+                clip_reward=10.0,    # Clip rewards to [-10, 10]
                 gamma=0.99           # Discount factor
             )
-            logger.info("VecNormalize applied for training (observation normalization only, reward clipping)")
+            logger.info("VecNormalize applied for training (observation and reward normalization enabled)")
 
         logger.info(f"Single-pair environment created (USD/JPY) - Training: {is_training}")
         return env
