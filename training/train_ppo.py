@@ -853,8 +853,16 @@ def find_latest_checkpoint() -> Optional[str]:
     if not checkpoint_dir.exists():
         return None
 
-    # Find all checkpoint files
-    checkpoint_files = list(checkpoint_dir.glob("forex_ppo_chunk_*"))
+    # Find all checkpoint ZIP files (exclude .yaml metadata files)
+    checkpoint_files = [
+        f for f in checkpoint_dir.glob("forex_ppo_chunk_*.zip")
+        if 'emergency' not in f.name  # Prefer regular checkpoints over emergency
+    ]
+
+    # If no regular checkpoints, check for emergency checkpoint
+    if not checkpoint_files:
+        checkpoint_files = list(checkpoint_dir.glob("forex_ppo_chunk_emergency_*.zip"))
+
     if not checkpoint_files:
         return None
 
@@ -863,9 +871,14 @@ def find_latest_checkpoint() -> Optional[str]:
         name = path.stem
         parts = name.split('_')
         try:
-            chunk_num = int(parts[3])  # forex_ppo_chunk_X_timestamp
-            timestamp = parts[4] + '_' + parts[5]  # YYYYMMDD_HHMMSS
-            return (chunk_num, timestamp)
+            # Handle both regular (forex_ppo_chunk_X_YYYYMMDD_HHMMSS)
+            # and emergency (forex_ppo_chunk_emergency_TIMESTAMP_YYYYMMDD_HHMMSS) formats
+            if 'emergency' in name:
+                return (999, parts[-2] + '_' + parts[-1])  # Emergency gets high priority
+            else:
+                chunk_num = int(parts[3])  # forex_ppo_chunk_X_timestamp
+                timestamp = parts[4] + '_' + parts[5]  # YYYYMMDD_HHMMSS
+                return (chunk_num, timestamp)
         except (IndexError, ValueError):
             return (0, "")
 
